@@ -38,6 +38,20 @@ NUDGE = ("You have a calc tool for exact arithmetic. Use it for every arithmetic
 NUDGE_NONE = "Do every arithmetic step exactly."
 
 
+def tool_close(tok) -> int:
+    """The token that ends a tool call: </function_calls> (OLMo-Hybrid) or </tool_call>."""
+    vocab = tok.get_vocab()
+    return vocab["</function_calls>" if "</function_calls>" in vocab else "</tool_call>"]
+
+
+def run_value(out: str) -> str:
+    """The value a run printed: OLMo's environment turn holds it between environment\\n and
+    <|im_end|>; Qwen's tool response on its third line."""
+    if "environment\n" in out:
+        return out.split("environment\n", 1)[1].split("<|im_end|>", 1)[0]
+    return out.split("\n")[2] if out.count("\n") > 2 else out
+
+
 def calc_response(expr: str) -> str:
     """The firmware's tool response for an expression (computed by the host)."""
     e = expr.replace("\n", "")
@@ -66,7 +80,11 @@ class BridgeHost:
         try:
             self.ses.qwen([t])
         except RuntimeError:  # the run did not halt: an error response (rv1 would loop on)
-            p = self.ses.T.printable
+            T = self.ses.T
+            if T.groups:  # OLMo-Hybrid's environment turn
+                return T.encode("<|im_end|>\n<|im_start|>environment\nerror (did not halt)"
+                                "<|im_end|>\n<|im_start|>assistant\n")
+            p = T.printable
             body = [10, 256, 10, *b"error (did not halt)\n", 257, 10, 258, 10, 10, 259, 10, 10]
             return [p[b] for b in body]
         return [x - S.TEXT_TOKEN for x in self.ses.toks[k + 1:] if S.is_text(x)]
@@ -81,7 +99,7 @@ def run_base(model, tok, ids, tool: bool, budget: int, host: BridgeHost | None =
     """Greedy decoding of base Qwen; with ``tool`` the host answers calc calls (``host``: the
     machine's own responses, else calc.expected's)."""
     dev = next(model.parameters()).device
-    tcc = tok.convert_tokens_to_ids("</tool_call>")
+    tcc = tool_close(tok)
     eos = {tok.convert_tokens_to_ids("<|im_end|>"), tok.convert_tokens_to_ids("<|endoftext|>")}
     seq, gen, own, calls = list(ids), [], 0, 0
     while own < budget:
@@ -139,10 +157,17 @@ def main() -> None:
         chat = RvChat(args.model, executor=args.chip_path == "executor")
         tok = chat.tok
     else:
-        from transformers import AutoModelForImageTextToText, AutoTokenizer
+        from transformers import (
+            AutoConfig,
+            AutoModelForCausalLM,
+            AutoModelForImageTextToText,
+            AutoTokenizer,
+        )
 
         tok = AutoTokenizer.from_pretrained(args.model)
-        model = AutoModelForImageTextToText.from_pretrained(args.model, dtype=torch.bfloat16)
+        model_cls = (AutoModelForCausalLM if AutoConfig.from_pretrained(args.model).model_type
+                     == "olmo_hybrid" else AutoModelForImageTextToText)
+        model = model_cls.from_pretrained(args.model, dtype=torch.bfloat16)
         model = model.to("cuda").eval()
         if tool and args.host == "bridge":
             T = BR.Text(Path(args.model) / "tokenizer.json")
@@ -182,7 +207,7 @@ def main() -> None:
             head_mismatch=r["head_mismatch"], gen_seconds=round(r["seconds"], 1),
             chip_path=args.chip_path, chip_seconds=r["chip_seconds"],
             text_seconds=r["text_seconds"], batch=args.batch,
-            results=[o.split("\n")[2] if o.count("\n") > 2 else o for o in outs])
+            results=[run_value(o) for o in outs])
 
     def emit(p, text, fields, seconds):
         rec = {"id": p["id"], "gold": p["gold"], "question": p["question"], "cond": args.cond}
