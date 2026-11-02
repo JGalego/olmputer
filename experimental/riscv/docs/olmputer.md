@@ -198,3 +198,55 @@ One digit per token, OLMo garbles every number. So numbers are echoed as OLMo's 
   (`<|im_end|>` is also an echo).
 - `RvChat.force(ids, stream, owned)`: a machine run teacher-forced through the merged weights,
   transparent to chip tokens (Gate 2b).
+
+## Gates 1-3 (HF Jobs; `olmputer.py` in hf-jgalego `beyond/olmputer/`)
+
+### Gate 1: olmo-tiny (`check`)
+olmo-tiny: 11 chip layers, hidden 2,816, 3,130M parameters. For each program the residual
+before the exit layer equals the IR evaluator's on every circuit dim at every position (bf16,
+traces up to 60k tokens, prefilled in 8,192-token chunks), and free-running greedy `generate`
+reproduces the reference trace token for token.
+
+| Run | Kernels | Programs | Exact | Trace tokens |
+|---|---|---|---|---|
+| LOOP, MEMCPY, rv32ui (38), rv32um (8), rv32uzba (3), c-crc32p, calc | torch fallback, A10G | 55 | 55 | 26,677 |
+| the same | fla, A10G | 55 | 55 | 26,677 |
+| c-sieve, c-gmpmul | torch fallback, A10G | 2 | 2 | 66,825 |
+| c-qsort (generate only) | torch fallback, A10G | 1 | 1 | 240,175 |
+
+Also exact: `loop` on the CPU fallback (cpu-upgrade). Two fixes on the way: the residual check
+computed all positions' logits (19 GB at 44k tokens; now one) and prefilled 44k tokens at once
+(now 8,192 at a time, the cache carrying the state).
+
+### Gate 2a: text parity (`parity`, A100)
+KL(base || merged), mean over 16 held-out prompts: **5.87e-4**; the noise floor, base sdpa vs
+base eager: **5.66e-4**. Greedy 32-token continuations identical to base: **12/16**; base sdpa vs
+base eager: 11/16. Teacher-forced top-1 agreement 98.5%. Tokenizer identical on 4/4 samples.
+
+### Gate 2b: the machine in the merged weights (`force`, A100)
+`RvChat.force`: a machine run teacher-forced through the merged model, chip tokens through the
+chip layers only and echoed text through every layer. calc 651/651, c-strops 1,074/1,074,
+rv32ui-lb 193/193, rv32um-div 142/142 circuit-owned positions exact (2,060/2,060).
+
+### Gate 3: conversations (`chat`, A100, `calc-olmo.elf`)
+24 conversations (the brief's question, then seeded products, sums, quotients and exact
+fractions), each locked to the reference as it is generated and replayed through the IR:
+**24/24 clean**: 0 lock errors, 0 wrong predictions and 0 owner mismatches over 191,100
+circuit-owned positions, 0 stock-head mismatches. 190,709 chip tokens, 1,521 text tokens, about
+157 s a conversation on the HF path.
+
+"Use calc: what is 123456789 * 987654321?" returns "The result of 123456789 multiplied by
+987654321 is 121932631112635269."
+
+How OLMo handles the echo: OLMo's final answer holds the machine's value in 19/24 (thousands
+separators ignored; 4/24 verbatim, OLMo likes commas). The 5 misses are OLMo re-typing the value
+with commas and dropping or changing digits, e.g. `8441394907539` answered as
+`8,441,399,007,539`. The machine's echo was exact in all 24.
+
+### Tests
+The suite on `cfaef76` (Qwen and OLMo tests, the Qwen3.5 tokenizer, 8 workers): 347 passed, 24
+skipped, 2 failed: `test_fuzz_free_running_cpu`, which fails on upstream `bec1a0c` too
+(`fastexec.py` does not know the bridge's `Q` family: upstream's baseline is 247 passed, 1
+failed), and `test_digit_groups_are_olmo_tokens`, a test bug (fixed in `9b7d74b`, passing). The
+Qwen path is byte-identical to upstream: 453/453 hashes of Qwen rv-tiny's tensors and snapshot
+rows match.
