@@ -31,6 +31,18 @@ def logprobs(model, seqs, nq, dev):
     return out
 
 
+@torch.no_grad()
+def greedy(model, prompts, dev):
+    return [model.generate(torch.tensor([ids], device=dev), max_new_tokens=N_NEW,
+                           do_sample=False)[0].tolist() for ids in prompts]
+
+
+def diverge(h, g, start):
+    """The first generated position where two greedy continuations differ (None: identical)."""
+    return next((i - start for i in range(start, min(len(h), len(g))) if h[i] != g[i]),
+                None if len(h) == len(g) else min(len(h), len(g)) - start)
+
+
 def kl(a, b):
     return [float((p.float().exp() * (p.float() - q.float())).sum(-1).mean()) for p, q in zip(a, b)]
 
@@ -71,24 +83,26 @@ def main() -> None:
     eager = base_cls.from_pretrained(args.base, dtype=torch.bfloat16,
                                      attn_implementation="eager").to(dev)
     le = logprobs(eager, seqs, nq, dev)
+    eager_greedy = greedy(eager, prompts, dev)  # the greedy noise floor
     del eager
     gc.collect()
     torch.cuda.empty_cache()
     merged = AutoModelForCausalLM.from_pretrained(args.merged, dtype=torch.bfloat16).to(dev)
     lm = logprobs(merged, seqs, nq, dev)
-    same_greedy = []
-    with torch.no_grad():
-        for ids, g in zip(prompts, seqs):
-            h = merged.generate(torch.tensor([ids], device=dev), max_new_tokens=N_NEW,
-                                do_sample=False)
-            same_greedy.append(h[0].tolist() == g)
+    merged_greedy = greedy(merged, prompts, dev)
+    same_greedy = [h == g for h, g in zip(merged_greedy, seqs)]
     k_m, k_e = kl(lb, lm), kl(lb, le)
     top1 = [float((p.argmax(-1) == q.argmax(-1)).float().mean()) for p, q in zip(lb, lm)]
     res = {"kl_merged_mean": sum(k_m) / len(k_m), "kl_noise_floor_mean": sum(k_e) / len(k_e),
            "kl_merged": k_m, "kl_noise_floor": k_e, "top1_agree": top1,
-           "greedy_identical": same_greedy, "tokenizer_identical": tok_same}
+           "greedy_identical": same_greedy, "tokenizer_identical": tok_same,
+           "greedy_noise_floor": [h == g for h, g in zip(eager_greedy, seqs)],
+           "first_divergence": [diverge(h, g, len(p)) for h, g, p in
+                                zip(merged_greedy, seqs, prompts)],
+           "first_divergence_noise_floor": [diverge(h, g, len(p)) for h, g, p in
+                                            zip(eager_greedy, seqs, prompts)]}
     print(json.dumps({k: v for k, v in res.items() if k.endswith("mean")
-                      or k in ("greedy_identical", "tokenizer_identical")}, indent=1))
+                      or k.startswith(("greedy", "first", "tokenizer"))}, indent=1))
     with open(args.out, "w") as f:
         json.dump(res, f, indent=1)
 
