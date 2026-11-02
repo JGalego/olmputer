@@ -72,8 +72,7 @@ def test_digit_groups_are_olmo_tokens(T):
     want = str(2**200 // 3**50)
     echo = ses.runs[-1]
     assert T.decode_bytes(echo).decode() == TURN.format(want)
-    turn = T.encode(TURN.format(want))
-    assert echo == turn[:-1]  # (the HALT echo is the last newline)
+    assert echo == T.encode(TURN.format(want))  # (HALT's echo is the last newline)
 
 
 def test_history_then_two_calls(T, circuit):
