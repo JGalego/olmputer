@@ -90,7 +90,7 @@ def text_rows(c, lay, T: BR.Text, base_emb: torch.Tensor, v0: int) -> torch.Tens
     d0 = base_emb.shape[1]
     full = torch.zeros(v0, h, dtype=torch.bfloat16)
     full[:, :d0] = base_emb[:v0, :d0]
-    special = sorted({T.TCO, T.TCC, *T.printable})
+    special = sorted({T.TCO, T.TCC, *T.pindex})
     q_plain = next(q for q in range(T.n) if q not in set(special))
     plain = embedding_rows(c, lay, [BR.text_token(q_plain)], h)[0]  # (bytes zeroed below)
     byte_cols = [[lay.dim(next(iter(c.tb[k][i].terms))) for i in range(8)]
