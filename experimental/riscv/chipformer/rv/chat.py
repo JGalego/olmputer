@@ -447,7 +447,7 @@ class RvChat:
         pos, wrong = len(ids), []
         for x, t in enumerate(stream[:-1]):
             chip_in = not S.is_text(t)
-            hc, _ = self._layers(t if chip_in else t - S.TEXT_TOKEN, cache,
+            hc, _ = self._layers(self.v0 + t if chip_in else t - S.TEXT_TOKEN, cache,
                                  None if chip_in else pos)
             pos += not chip_in
             if owned[x]:
