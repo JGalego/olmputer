@@ -32,7 +32,8 @@ def residual_check(model, c, prog) -> int:
         cache = firmware.load_cache(model, c, ref.Machine.from_program(prog))
         with torch.no_grad():
             o = model(input_ids=torch.tensor([toks], device=dev), past_key_values=cache,
-                      use_cache=True, output_hidden_states=True)
+                      use_cache=True, output_hidden_states=True,
+                      logits_to_keep=1)  # (all positions' logits: 19 GB at 44k tokens)
     h = o.hidden_states[c.n_layers() - 1][0].double().cpu().numpy()
     lay = model.layout
     dims = [d for d in range(1, len(c.dims))
