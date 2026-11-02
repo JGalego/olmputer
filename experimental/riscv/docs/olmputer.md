@@ -250,3 +250,34 @@ skipped, 2 failed: `test_fuzz_free_running_cpu`, which fails on upstream `bec1a0
 failed), and `test_digit_groups_are_olmo_tokens`, a test bug (fixed in `9b7d74b`, passing). The
 Qwen path is byte-identical to upstream: 453/453 hashes of Qwen rv-tiny's tensors and snapshot
 rows match.
+
+## The executor on OLMo's heads (`rv/tritonexec.py`)
+A head's state is a power-of-2 tile (OLMo: 96 x 192 padded to 128 x 256), the ballast columns
+come from a mask and the norm divides by the real value width; Qwen3.5's tiles stay 128 x 128.
+`execcheck` (A10G): the executor equals the IR on every dim at every position on the OLMo bridge
+circuit (20,786 positions of four calc calls), and on c-crc32p on both OLMo's and Qwen3.5's
+heads (6,283 each). Gate 3 on the executor: the same 24 conversations, token for token
+identical to the HF path and clean, in 157 s instead of 3,762 s (24x).
+
+## Phase 4: arithmetic (`evalarith`, n = 40 a set, greedy, exact rational match)
+rv1 is Olmputer (the chip layers on the executor, every circuit token checked against the
+reference as generated); pytool is base OLMo whose calc calls the same firmware answers on a
+reference machine (its responses are byte for byte rv1's); base_nudge is base OLMo without tools.
+All on fla kernels.
+
+| Set | rv1 | pytool | base_nudge |
+|---|---|---|---|
+| arith (seeded synthetic) | 40/40 | 40/40 | 25/40 |
+| dmx_mul_big | 40/40 | 40/40 | 14/40 |
+| dmx_div_big | 37/40 | 37/40 | 11/40 |
+| dmx_mul_div_multiple_longer | 24/40 | 22/40 | 16/40 |
+| dmx_add_or_sub_big | 38/40 | 38/40 | 21/40 |
+| total | **179/200** | 177/200 | 87/200 |
+
+- rv1: 0 lock errors and 0 head mismatches over 299 calls and 1,481,063 chip tokens.
+- rv1 and pytool write the same transcript on 184 of 200 problems; the merged model's small
+  numeric differences send the other 16 down different paths, and 4 of those score differently
+  (3 for rv1, 1 for pytool).
+- The misses are OLMo's: wrong expressions (`dmx_mul_div_multiple_longer-1020`: 638 for 319),
+  and calls that exceed the firmware's 7 bignum registers ("error (too complex: split it)",
+  upstream's limit too).
