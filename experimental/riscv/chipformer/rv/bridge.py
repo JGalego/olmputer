@@ -24,8 +24,16 @@ from pathlib import Path
 from chipformer.rv import ref
 from chipformer.rv import spec as S
 
-# special tokens the firmware prints with putchar(256 + k)
-SPECIALS = ["<tool_response>", "</tool_response>", "<think>", "</think>"]
+# per host (keyed by its tool-call opener): the tool-call delimiters, the special tokens the
+# firmware prints with putchar(256 + k), and whether numbers are echoed as digit groups
+# (spec.GROUP_BASE: OLMo reads its own 3-digit number tokens, not one digit per token)
+HOSTS = {
+    "<tool_call>": ("<tool_call>", "</tool_call>",  # Qwen3.5
+                    ["<tool_response>", "</tool_response>", "<think>", "</think>"], False),
+    "<function_calls>": ("<function_calls>", "</function_calls>",  # OLMo-Hybrid
+                         ["<|im_end|>", "<|im_start|>", "environment", "assistant"], True),
+}
+SPECIALS = HOSTS["<tool_call>"][2]
 
 
 def bytes_to_unicode() -> dict[int, str]:
@@ -61,10 +69,15 @@ class Text:
             else:
                 self.bytes[i] = bytes(dec[ch] for ch in s)
         ids = {s: i for s, i in vocab.items()}
-        self.TCO, self.TCC = ids["<tool_call>"], ids["</tool_call>"]
+        tco, tcc, self.specials, self.groups = HOSTS[next(k for k in HOSTS if k in ids)]
+        self.TCO, self.TCC = ids[tco], ids[tcc]
         u = bytes_to_unicode()
-        self.printable = [ids[u[b]] for b in range(256)] + [ids[s] for s in SPECIALS]
-        self.pindex = {q: p for p, q in enumerate(self.printable)}
+        self.printable = [ids[u[b]] for b in range(256)] + [ids[s] for s in self.specials]
+        if self.groups:  # printable index a0 of putchar(a0): None where nothing is printed
+            self.printable += [None] * (S.GROUP_BASE - len(self.printable))
+            self.printable += [ids[S.group_text(S.GROUP_BASE + i)]
+                               for i in range(S.GROUP_COUNT)]
+        self.pindex = {q: p for p, q in enumerate(self.printable) if q is not None}
         self.NL = self.printable[10]
 
     def printable_index(self, qid: int) -> int | None:
@@ -166,7 +179,10 @@ class Session:
                 self._push(t, True)
                 fam, p = S.family(t)
                 if fam == "BYTE":
-                    q = self.T.printable[p] if p < len(self.T.printable) else self.T.NL
+                    if p == S.GROUP_MARK and len(rec) == 2:  # a digit group: V(a0) BYTE(mark)
+                        p = S.family(rec[0])[1]
+                    q = (self.T.printable[p] if p < len(self.T.printable)
+                         and self.T.printable[p] is not None else self.T.NL)
                     echo.append(q)
                     self._push(text_token(q), True)
             if rec[-1] == S.tok("HALT"):

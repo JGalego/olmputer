@@ -35,6 +35,26 @@ static char one_ch = '1';
 
 static int dig(num a, int i) { return bn_get(BN_OPS(0, i, 0, REG(a), 0, 0)); }
 
+#ifdef OLMO
+// OLMo-Hybrid reads numbers as its own tokens (digit runs split into groups of 3 from the left)
+// and misreads them one digit per token, so a run of digits is printed as those groups:
+// putchar(GROUP_BASE + i) is the group i ("000".."999", then "00".."99"), a single digit a byte.
+// No newline follows the value (the host's environment turn ends right after it).
+#define GROUP_BASE 512
+#define EOL ""
+
+static void put_run(num v, int hi, int lo) {  // the digits hi - 1 .. lo of v
+    for (int i = hi - 1, left = hi - lo; left > 0;) {
+        int s = left >= 3 ? 3 : left, g = 0;
+        for (int k = 0; k < s; k++) g = 10 * g + dig(v, i--);
+        left -= s;
+        rv_ecall2(1, s == 3 ? GROUP_BASE + g : s == 2 ? GROUP_BASE + 1000 + g : '0' + g, 0, 0);
+    }
+}
+#else
+#define EOL "\n"
+#endif
+
 static void wrote(num a, int n) {
     if (n > dirty[REG(a)]) dirty[REG(a)] = n;
 }
@@ -508,7 +528,8 @@ static int calc_eval(void) {  // prints the value (or "error") and a newline; 0 
     }
     if (err || nv != 1 || operand) {
     fail:
-        for (const char *m = err == 2 ? "error (too complex: split it)\n" : "error\n"; *m; m++)
+        for (const char *m = err == 2 ? "error (too complex: split it)" EOL : "error" EOL; *m;
+             m++)
             rv_putchar(*m);
         return 1;
     }
@@ -517,21 +538,40 @@ print:;
     int sc = vsc[0], n = LEN(v);
     if (NEG(v)) rv_putchar('-');
     if (!sc) {
+#ifdef OLMO
+        put_run(v, n, 0);
+#else
         bn_print(REG(v), n);
+#endif
     } else {  // digits with the point, no trailing zeros after it (0.5, 12, -0.004)
         int z = 0;
         while (z < sc && !dig(v, z)) z++;
+#ifdef OLMO
+        if (n > sc)
+            put_run(v, n, sc);
+        else
+            rv_putchar('0');
+        if (z < sc) {
+            rv_putchar('.');
+            put_run(v, sc, z);
+        }
+#else
         if (n <= sc) rv_putchar('0');
         for (int i = n > sc ? n - 1 : sc - 1; i >= z; i--) {
             if (i == sc - 1) rv_putchar('.');
             rv_putchar('0' + (i < n ? dig(v, i) : 0));
         }
+#endif
     }
     if (hasden[0]) {  // a reduced fraction: num/den
         rv_putchar('/');
+#ifdef OLMO
+        put_run(vden[0], LEN(vden[0]), 0);
+#else
         bn_print(REG(vden[0]), LEN(vden[0]));
+#endif
     }
-    rv_putchar('\n');
+    if (EOL[0]) rv_putchar('\n');
     return 0;
 }
 
@@ -569,6 +609,62 @@ static int gather(void) {
     return i > ROWS ? -2 : n;  // -2: no closing '<' within the capture window (truncated)
 }
 
+#ifdef OLMO
+// OLMo-Hybrid: the call is calc(expression="...") or with single quotes (Python call syntax, a
+// JSON string); its value is what follows the first quote after '=' up to the matching quote
+// (backslash escapes kept as the escaped character). The response is the host's environment
+// turn:  <|im_end|>\n<|im_start|>environment\nVALUE<|im_end|>\n<|im_start|>assistant  (+ the
+// HALT echo \n)
+enum { IM_END = 256, IM_START, ENVIRONMENT, ASSISTANT };
+
+static int gather_call(void) {
+    int n = 0, q = 0, esc = 0, prev = 0, i;
+    for (i = 1; i <= ROWS; i++) {
+        const volatile unsigned char *r = TEXT + 16 * i;
+        int c = r[0];
+        if (!c) break;
+        for (int k = 0; k < 16 && c; c = ++k < 16 ? r[k] : 0) {
+            if (!q) {
+                if ((c == '"' || c == '\'') && prev == '=') q = c;
+                prev = c;
+            } else if (!esc && c == '\\') {
+                esc = 1;
+            } else if (!esc && c == q) {
+                calc_in[n] = 0;
+                return n;
+            } else {
+                esc = 0;
+                if (c != '\n' && n < (int)sizeof calc_in - 1) calc_in[n++] = (char)c;
+            }
+        }
+    }
+    calc_in[n] = 0;
+    if (!q) return -1;
+    return i > ROWS ? -2 : n;
+}
+
+int main(void) {
+    for (;;) {
+        rv_ecall2(93, 0, 0, 0);  // park: HALT; the next GO resumes here
+        int n = gather_call();
+        put(IM_END);
+        put('\n');
+        put(IM_START);
+        put(ENVIRONMENT);
+        put('\n');
+        if (n < 0) {
+            for (const char *m = n == -2 ? "error (too long: split it)" : "error"; *m; m++)
+                put(*m);
+        } else {
+            calc_eval();
+        }
+        put(IM_END);
+        put('\n');
+        put(IM_START);
+        put(ASSISTANT);
+    }
+}
+#else
 int main(void) {
     for (;;) {
         rv_ecall2(93, 0, 0, 0);  // park: HALT; the next GO resumes here
@@ -591,6 +687,7 @@ int main(void) {
         put('\n');
     }
 }
+#endif
 #else
 int main(void) { return calc_eval(); }
 #endif

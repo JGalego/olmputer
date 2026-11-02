@@ -177,6 +177,9 @@ class RvCore(Circ):
             self.tau = f("tau", lambda t: TAU_TEXT if t >= tt else -1, full=True)
             self.isTCO = f("isTCO", lambda t: int(t == tt + text.TCO), full=True)
             self.isTCC = f("isTCC", lambda t: int(t == tt + text.TCC), full=True)
+            if text.groups:  # BYTE(GROUP_MARK): the echo is the digit group V(a0) named
+                self.isMark = f("isMark", lambda t: int(famof(t) == ("BYTE", S.GROUP_MARK)),
+                                full=True)
 
             def tbyte(k, i):
                 return lambda t: (text.row_bytes(t - tt)[k] >> i & 1) if t >= tt else 0
@@ -1175,7 +1178,15 @@ def build(target: Target | None = None, text=None) -> RvCore:
     case([j2, ok, sbsh], "V", merged[30:32])
     case([j3, ok, sbsh, 1 - EA[6]], "SS0")
     case([j3, ok, sbsh, EA[6]], "SS1")
-    case(nr + [ecall, a7_is[1]], "BYTE", B[0:9])  # a byte, or (256..) a P3 special token
+    if text and text.groups:  # GROUP_BASE <= a0 < GROUP_END: V(a0) BYTE(GROUP_MARK)
+        small = c.and_([1 - b for b in B[11:32]], "putc.small")
+        grp = c.node(c.t_in(from_bits(B[4:11]), S.GROUP_BASE >> 4, S.GROUP_END >> 4, 0, 127,
+                            lits=[small]), "putc.grp")
+        case(nr + [ecall, a7_is[1], 1 - grp], "BYTE", B[0:9])
+        case(nr + [ecall, a7_is[1], grp], "V", B[0:15])
+        case([j1, ok, ecall, a7_is[1], grp], "BYTE", [one] * 9)
+    else:
+        case(nr + [ecall, a7_is[1]], "BYTE", B[0:9])  # a byte, or (256..) a P3 special token
     case(nr + [ecall, a7_is[93]], "HALT")
     case(nr + [uops["FENCE"]], "NT")
     # digit-file ops: BD per digit (j < n), then rd = the last carry (or NT)
@@ -1198,8 +1209,16 @@ def build(target: Target | None = None, text=None) -> RvCore:
         case([jeq(1 + k), any_fault], "HEX", pc_bits[4 * (7 - k):4 * (8 - k)])
     case([jeq(9), any_fault], "HALT")
     owner = None
-    if text:
+    if text and text.groups:  # the echo of a digit group: the V payload at t - 1
+        (prev_v,) = thead(c, "prevV", {0: one}, {0: one},
+                          [{"data": {2 + i: Chan(pay["V"][i], (0, 1, 0, 0)) for i in range(15)},
+                            "ref": one}])
+        c.tables["prevV"] = c.nodes[-1]
+        cases.append(([fam["BYTE"], 1 - c.isMark], "Q", c.pay["BYTE"]))
+        cases.append(([fam["BYTE"], c.isMark], "Q", prev_v))
+    elif text:
         cases.append(([fam["BYTE"]], "Q", c.pay["BYTE"]))
+    if text:
         nl = text.printable_index(text.NL)  # a run ends in a newline
         cases.append(([fam["HALT"]], "Q", [one if nl >> i & 1 else Expr() for i in range(9)]))
         cases.append(([c.isTCC], "GO", 0))

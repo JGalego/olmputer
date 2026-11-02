@@ -99,29 +99,29 @@ class ExecRow:
 class RvChat:
     def __init__(self, path, device: str | None = None, fast: bool = True,
                  executor: bool = False) -> None:
-        from transformers import AutoTokenizer, Qwen3_5ForCausalLM
+        from transformers import AutoModelForCausalLM, AutoTokenizer
 
         from chipformer.q35.fast import exact_matmuls
-        from chipformer.q35.ir import Target
+        from chipformer.q35.ir import target_of
 
         exact_matmuls()
         self.path = Path(path)
         self.meta = json.loads((self.path / "chipformer.json").read_text())
         self.dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = Qwen3_5ForCausalLM.from_pretrained(self.path, dtype=torch.bfloat16)
+        self.model = AutoModelForCausalLM.from_pretrained(self.path, dtype=torch.bfloat16)
         self.model = self.model.to(self.dev).eval()
         self.lm = self.model.model
         self.tok = AutoTokenizer.from_pretrained(self.path)
         self.T = BR.Text(self.path / "tokenizer.json")
-        cfg = self.model.config
-        self.c = core.build(Target(cfg.linear_num_key_heads, cfg.linear_num_value_heads,
-                                   cfg.intermediate_size), self.T)
+        self.c = core.build(target_of(self.model.config.to_dict()), self.T)
         self.n_chip, self.v0 = self.meta["chip_layers"], self.meta["chip_token_offset"]
         self.code_dims = torch.tensor(self.meta["code_dims"], device=self.dev)
-        self.eos = {248046, 248044}
-        self.fast = fast and self.dev == "cuda"
+        # OLMo-Hybrid: NoPE, and the fast and executor chip paths are Qwen3.5's (HF path only)
+        self.olmo = self.meta.get("host") == "olmo_hybrid"
+        self.eos = {100257, 100265} if self.olmo else {248046, 248044}
+        self.fast = fast and self.dev == "cuda" and not self.olmo
         # executor "verify": both chip paths, the HF view's hc checked against the executor's
-        self.executor = executor if self.dev == "cuda" else False
+        self.executor = executor if self.dev == "cuda" and not self.olmo else False
         self.verify = self.executor == "verify"
         if self.executor:
             self._build_exec()
@@ -293,7 +293,9 @@ class RvChat:
         position pos); returns (residual after the chip layers, logits or None)."""
         h = self.lm.embed_tokens(torch.tensor([[ids]], device=self.dev))
         pe = tp = None
-        if pos is not None:
+        if pos is not None and self.olmo:
+            tp = torch.tensor([[pos]], device=self.dev)
+        elif pos is not None:
             p4 = torch.full((4, 1, 1), pos, device=self.dev, dtype=torch.long)
             tp = p4[0]
             pe = self.lm.rotary_emb(h, p4[1:])
@@ -355,6 +357,7 @@ class RvChat:
         mismatch = 0
         t_chip = t_text = 0.0
         expect, lock_error = [], None
+        owned = False  # nxt is the circuit's (an echo may be an eos id: OLMo's <|im_end|>)
         while n_text < max_new and n_chip_tok < max_chip:
             gen.append(nxt)
             if on_token is not None:
@@ -382,7 +385,7 @@ class RvChat:
                         lock_error = {"at": len(gen) - 1, "got": str(e), "want": "a halt"}
                         break
                     expect = list(lock.toks[k + 1:])
-            if nxt in self.eos:
+            if nxt in self.eos and not owned:
                 break
             if verbose and len(gen) % 500 == 0:
                 tail = [S.name(t - self.v0) if t >= self.v0 else repr(self.tok.decode([t]))
@@ -414,6 +417,7 @@ class RvChat:
                 t_chip += time.time() - ts
                 if nxt is None:
                     raise RuntimeError("the circuit gave up a chip position")
+                owned = True
             else:
                 n_text += 1
                 if self.fast or self.executor:
@@ -424,12 +428,35 @@ class RvChat:
                 if ct is not None and check_head and q != ct:
                     mismatch += 1
                 nxt = ct if ct is not None else int(torch.argmax(logits[: self.v0]))
+                owned = ct is not None
                 t_text += time.time() - ts
         dt = time.time() - t0
         return {"tokens": gen, "text_tokens": n_text, "chip_tokens": n_chip_tok,
                 "seconds": dt, "head_mismatch": mismatch, "lock_error": lock_error,
                 "verify_mismatch": n_verify_bad if self.verify else None,
                 "chip_seconds": round(t_chip, 2), "text_seconds": round(t_text, 2)}
+
+    @torch.no_grad()
+    def force(self, ids: list[int], stream: list[int], owned: list[bool]) -> dict:
+        """Teacher-forced: the prompt ``ids``, then the circuit's token ``stream`` (from GO, as
+        bridge.Session writes it; the snapshot already in self.c), transparent to chip tokens.
+        Every position in ``owned`` must predict the stream's next token."""
+        out = self.model(input_ids=torch.tensor([ids], device=self.dev), use_cache=True)
+        cache = out.past_key_values
+        hf.inject(self.c, cache)
+        pos, wrong = len(ids), []
+        for x, t in enumerate(stream[:-1]):
+            chip_in = not S.is_text(t)
+            hc, _ = self._layers(t if chip_in else t - S.TEXT_TOKEN, cache,
+                                 None if chip_in else pos)
+            pos += not chip_in
+            if owned[x]:
+                got = self.circuit_token(hc)
+                want = stream[x + 1]
+                if got != (self.v0 + want if want < S.VOCAB else want - S.TEXT_TOKEN):
+                    wrong.append(x)
+        return {"positions": len(stream) - 1, "owned": sum(owned[:-1]), "wrong": len(wrong),
+                "first_wrong": wrong[:5]}
 
     def to_stream(self, ids: list[int]) -> list[int]:
         """Model ids -> the circuit's token stream (chip tokens, TEXT_TOKEN | qwen id)."""

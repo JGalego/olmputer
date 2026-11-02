@@ -518,6 +518,11 @@ class Machine:
                     S.tok(f"SS{w4}")]
         if op == "ECALL":
             a, b = x[17], x[10]  # the call (a7) and its argument (a0)
+            if a == 1 and S.GROUP_BASE <= b < S.GROUP_END:  # a digit group (P3, OLMo)
+                self.out.extend(S.group_text(b).encode() if b < S.GROUP_BASE + S.GROUP_COUNT
+                                else b"")
+                self.n += 1
+                return [S.tok("V", b), S.tok("BYTE", S.GROUP_MARK)]
             if a == 1:  # putchar(a0): a byte, or (256..) a special token of the P3 bridge
                 if b & 0x1FF < 256:
                     self.out.append(b & 0xFF)

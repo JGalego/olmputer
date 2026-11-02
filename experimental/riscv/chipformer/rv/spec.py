@@ -13,7 +13,8 @@ Token families (chip vocabulary ids from 0):
   F2    final; after two V: value bits 30..31
   J     final; jump: anchor = payload (a 16-bit ROM word index), n = 0
   R     final; anchor refresh: anchor = payload, n = 0, nothing executes
-  BYTE  final; putchar (ecall a7 = 1): a0 & 511 (0..255 a byte; 256.. a special token, P3)
+  BYTE  final; putchar (ecall a7 = 1): a0 & 511 (0..255 a byte; 256.. a special token, P3);
+        511 marks a digit-group echo (P3, OLMo: the record V(a0) BYTE(511), see GROUP_BASE)
   FLT   not final; a fault: payload = cause (FAULTS), then 8 HEX digits of the PC, then HALT
   HEX   not final; a hex digit of a fault record
   QS    not final; DIV/DIVU/REM/REMU: k0, the index of the first quotient digit computed (0..8)
@@ -36,6 +37,7 @@ Records:
   SW                                                             ST0 / ST1
   SB, SH                                                         V V V SS0 / SS1 (merged word)
   ECALL a7 = 1 (putchar a0)                                      BYTE
+  ECALL a7 = 1, GROUP_BASE <= a0 < GROUP_END (a digit group)     V(a0) BYTE(511)
   ECALL a7 = 93 (exit)                                           HALT
   a fault                                                        FLT(cause) HEX x 8 HALT
   before the instruction, when n == 63                           R
@@ -67,6 +69,18 @@ CTRL = _base
 CONTROL_NAMES = ["NT", "ST0", "ST1", "SS0", "SS1", "HALT", "GO", "SC"]
 CONTROLS = {n: CTRL + i for i, n in enumerate(CONTROL_NAMES)}
 VOCAB = CTRL + len(CONTROL_NAMES)
+# (P3, OLMo-Hybrid) putchar(GROUP_BASE + i): the digit group i, "000".."999" then "00".."99",
+# echoed as one of the host's own number tokens (it splits digit runs into groups of 3)
+GROUP_BASE, GROUP_COUNT = 512, 1100
+GROUP_END = 1616  # (rounded up to a multiple of 16: the circuit tests a0 >> 4; never printed)
+GROUP_MARK = 511
+
+
+def group_text(a0: int) -> str:
+    i = a0 - GROUP_BASE
+    return f"{i:03d}" if i < 1000 else f"{i - 1000:02d}"
+
+
 FINAL = {"F0", "F1", "F2", "J", "R", "BYTE", "NT", "ST0", "ST1", "SS0", "SS1", "HALT"}
 PAYLOAD_BITS = {n: (s - 1).bit_length() for n, s in FAMILY_SIZES}
 

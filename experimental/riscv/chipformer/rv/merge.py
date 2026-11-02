@@ -1,4 +1,4 @@
-"""Merge the RV32 machine and its text bridge into Qwen3.5-4B (layout "rv1").
+"""Merge the RV32 machine and its text bridge into Qwen3.5-4B or OLMo-Hybrid-7B (layout "rv1").
 
     python -m chipformer.rv.merge SRC --out dist/q4-rv1 [--no-mute]
 
@@ -13,6 +13,14 @@ The result is a text-only stock ``Qwen3_5ForCausalLM``:
   vocabulary as special tokens;
 - the tied output head reads only the output code and tau among the chip dims (q35.merge's
   final-norm gains), and Qwen's layers are muted on chip tokens (q35.mute, on mu).
+
+OLMo-Hybrid (a stock ``OlmoHybridForCausalLM``) differs in four places: its norms' gains are
+``w`` (rescaled as ``w * scale``), its full-attention layers are post-norm (their
+``post_attention_layernorm`` and ``post_feedforward_layernorm`` see sublayer outputs that are 0
+on the chip dims, so they get the same rescale), its output head is untied (written as the
+embedding with OLMo's own rows over its own dims), and its layers are not muted: full attention
+has no output gate, so chip tokens must stay out of OLMo's layers (rv/chat.py's transparent
+decoding).
 
 ``chipformer.json`` records the layout for the decoder (rv/chat.py).
 """
@@ -33,6 +41,11 @@ from chipformer.rv import spec as S
 
 SRC_TEXT = "model.language_model."
 DST = "model."
+# OLMo-Hybrid: the hidden dim's axis of each weight, and the norms over the full residual
+OLMO_IN = re.compile(r"(q_proj|k_proj|v_proj|g_proj|a_proj|b_proj|gate_proj|up_proj)\.weight$")
+OLMO_OUT = re.compile(r"(o_proj|down_proj)\.weight$")
+OLMO_NORMS = re.compile(r"(input_layernorm|post_attention_layernorm|post_feedforward_layernorm)"
+                        r"\.weight$|^model\.norm\.weight$")
 
 
 def chip_token_names() -> list[str]:
@@ -103,17 +116,19 @@ def build_merged(src, dst, mute_qwen: bool = True, hidden: int | None = None,
                  m: int | None = None) -> dict:
     from safetensors.torch import save_file
 
-    from chipformer.q35.emit import Layout, allocate, check_bf16, emit_layers
-    from chipformer.q35.ir import Target
+    from chipformer.q35.emit import Layout, allocate, check_bf16, emit_layers, is_olmo
+    from chipformer.q35.ir import target_of
     from chipformer.q35.tiny import code_gain
     from chipformer.rv.tiny import embedding_matrix
 
     src, dst = Path(src), Path(dst)
     cfg = json.loads((src / "config.json").read_text())
-    tc0 = cfg["text_config"]
+    tc0 = cfg.get("text_config", cfg)
+    olmo = is_olmo(tc0)
+    src_text = "model." if olmo else SRC_TEXT
     d0, v0, inter = tc0["hidden_size"], tc0["vocab_size"], tc0["intermediate_size"]
     T = BR.Text(src / "tokenizer.json")
-    c = core.build(Target(tc0["linear_num_key_heads"], tc0["linear_num_value_heads"], inter), T)
+    c = core.build(target_of(tc0, inter), T)
     keep = set(c.keep)
     alloc = allocate(c, None, keep, inter)
     if hidden is None:
@@ -127,10 +142,16 @@ def build_merged(src, dst, mute_qwen: bool = True, hidden: int | None = None,
           f"{n_chip} chip layers", flush=True)
 
     tc = {k: v for k, v in tc0.items() if k != "full_attention_interval"}
-    tc.update(hidden_size=hidden, num_hidden_layers=n_chip + n0, mtp_num_hidden_layers=0,
+    tc.update(hidden_size=hidden, num_hidden_layers=n_chip + n0,
               layer_types=["linear_attention"] * n_chip + tc0["layer_types"],
-              vocab_size=-(-(v0 + S.VOCAB) // 64) * 64, tie_word_embeddings=True,
-              architectures=["Qwen3_5ForCausalLM"], model_type="qwen3_5_text")
+              vocab_size=-(-(v0 + S.VOCAB) // 64) * 64)
+    if olmo:
+        mute_qwen = False  # (see the module docstring)
+        tc.update(tie_word_embeddings=False, architectures=["OlmoHybridForCausalLM"],
+                  model_type="olmo_hybrid")
+    else:
+        tc.update(mtp_num_hidden_layers=0, tie_word_embeddings=True,
+                  architectures=["Qwen3_5ForCausalLM"], model_type="qwen3_5_text")
     vocab = tc["vocab_size"]
 
     sinks = None
@@ -144,24 +165,29 @@ def build_merged(src, dst, mute_qwen: bool = True, hidden: int | None = None,
     # Qwen's weights, widened and renamed one tensor at a time (keeps peak memory low)
     scale = (d0 / hidden) ** 0.5
     sd = {}
-    base_emb = None
+    base_emb = base_head = None
+    in_cols, out_rows, norms = (OLMO_IN, OLMO_OUT, OLMO_NORMS) if olmo else (
+        IN_COLS, OUT_ROWS, WIDE_NORMS)
     for f in sorted(src.glob("*.safetensors")):
         with safe_open(f, "pt") as fh:
             for k in fh.keys():  # noqa: SIM118
-                if not k.startswith(SRC_TEXT):
+                if olmo and k == "lm_head.weight":
+                    base_head = fh.get_tensor(k)
+                    continue
+                if not k.startswith(src_text):
                     continue  # vision tower, mtp
                 w = fh.get_tensor(k)
-                if k == SRC_TEXT + "embed_tokens.weight":
+                if k == src_text + "embed_tokens.weight":
                     base_emb = w
                     continue
-                if IN_COLS.search(k):
+                if in_cols.search(k):
                     w = torch.cat([w, w.new_zeros(*w.shape[:-1], hidden - d0)], -1)
-                elif OUT_ROWS.search(k):
+                elif out_rows.search(k):
                     w = torch.cat([w, w.new_zeros(hidden - d0, *w.shape[1:])], 0)
-                elif WIDE_NORMS.search(k):
-                    g = (1.0 + w.float()) * scale - 1.0
+                elif norms.search(k):
+                    g = w.float() * scale if olmo else (1.0 + w.float()) * scale - 1.0
                     w = torch.cat([g.to(w.dtype), w.new_zeros(hidden - d0)])
-                k2 = DST + k[len(SRC_TEXT):]
+                k2 = DST + k[len(src_text):]
                 k2 = re.sub(r"^(model\.layers\.)(\d+)\.", lambda mt: f"{mt[1]}{int(mt[2]) + n_chip}.",
                             k2)
                 sd[k2] = w
@@ -186,11 +212,16 @@ def build_merged(src, dst, mute_qwen: bool = True, hidden: int | None = None,
     del chip
     check_bf16("embedding", emb[:, d0:].float()[: min(vocab, 300000)])
     sd[DST + "embed_tokens.weight"] = emb
+    if olmo:  # the untied head: the embedding's chip columns, OLMo's own rows on its dims
+        head = emb.clone()
+        head[:v0, :d0] = base_head[:v0, :d0]
+        sd["lm_head.weight"] = head
+        del base_head
 
     code = [next(iter(e.terms)) for e in c.code]
     tau = next(iter(c.tau.terms))
     norm = sd[DST + "norm.weight"].float()
-    norm[d0:] = -1.0  # chip dims are invisible to the lm_head ...
+    norm[d0:] = 0.0 if olmo else -1.0  # chip dims are invisible to the lm_head ...
     for d in code:  # ... except the output code and tau
         norm[lay.dim(d)] = code_gain(lay)
     norm[lay.dim(tau)] = TAU_GAIN
@@ -215,11 +246,14 @@ def build_merged(src, dst, mute_qwen: bool = True, hidden: int | None = None,
     (dst / "model.safetensors.index.json").write_text(json.dumps(index, indent=2))
     (dst / "config.json").write_text(json.dumps(tc, indent=2))
     extend_tokenizer(src, dst, v0)
-    gen = {"eos_token_id": [248046, tc0.get("eos_token_id", 248044)],
-           "pad_token_id": tc0.get("eos_token_id", 248044), "bad_words_ids": [[IM_START]],
-           "do_sample": False}
+    if olmo:
+        gen = json.loads((src / "generation_config.json").read_text()) | {"do_sample": False}
+    else:
+        gen = {"eos_token_id": [248046, tc0.get("eos_token_id", 248044)],
+               "pad_token_id": tc0.get("eos_token_id", 248044), "bad_words_ids": [[IM_START]],
+               "do_sample": False}
     (dst / "generation_config.json").write_text(json.dumps(gen, indent=2))
-    meta = {"layout": "rv1", "chip_token_offset": v0, "chip_vocab": S.VOCAB,
+    meta = {"layout": "rv1", "host": tc["model_type"], "chip_token_offset": v0, "chip_vocab": S.VOCAB,
             "chip_layers": n_chip, "qwen_layers_from": n_chip, "hidden": hidden,
             "chip_dims_offset": d0, "ballast_dims": m, "circuit": c.stats(),
             "slots": alloc.n_slots, "muted": mute_qwen,

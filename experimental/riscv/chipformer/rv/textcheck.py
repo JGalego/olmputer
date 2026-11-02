@@ -1,4 +1,4 @@
-"""Text fidelity of a merged rv1 checkpoint against its base Qwen3.5.
+"""Text fidelity of a merged rv1 checkpoint against its base (Qwen3.5 or OLMo-Hybrid).
 
     python -m chipformer.rv.textcheck BASE MERGED [--out dist/rv-text.json]
 
@@ -36,7 +36,12 @@ def kl(a, b):
 
 
 def main() -> None:
-    from transformers import AutoModelForImageTextToText, AutoTokenizer, Qwen3_5ForCausalLM
+    from transformers import (
+        AutoConfig,
+        AutoModelForCausalLM,
+        AutoModelForImageTextToText,
+        AutoTokenizer,
+    )
 
     ap = argparse.ArgumentParser()
     ap.add_argument("base")
@@ -49,8 +54,10 @@ def main() -> None:
     tok_same = [tb(s).input_ids == tm(s).input_ids for s in SAMPLES]
     prompts = [encode(tb, k, t) for k, t in PROMPTS]
     nq = len(tb)
+    base_cls = (AutoModelForCausalLM if AutoConfig.from_pretrained(args.base).model_type
+                == "olmo_hybrid" else AutoModelForImageTextToText)
 
-    base = AutoModelForImageTextToText.from_pretrained(args.base, dtype=torch.bfloat16).to(dev)
+    base = base_cls.from_pretrained(args.base, dtype=torch.bfloat16).to(dev)
     seqs = []
     with torch.no_grad():
         for ids in prompts:
@@ -61,13 +68,13 @@ def main() -> None:
     del base
     gc.collect()
     torch.cuda.empty_cache()
-    eager = AutoModelForImageTextToText.from_pretrained(args.base, dtype=torch.bfloat16,
-                                                        attn_implementation="eager").to(dev)
+    eager = base_cls.from_pretrained(args.base, dtype=torch.bfloat16,
+                                     attn_implementation="eager").to(dev)
     le = logprobs(eager, seqs, nq, dev)
     del eager
     gc.collect()
     torch.cuda.empty_cache()
-    merged = Qwen3_5ForCausalLM.from_pretrained(args.merged, dtype=torch.bfloat16).to(dev)
+    merged = AutoModelForCausalLM.from_pretrained(args.merged, dtype=torch.bfloat16).to(dev)
     lm = logprobs(merged, seqs, nq, dev)
     same_greedy = []
     with torch.no_grad():
