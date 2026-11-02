@@ -20,6 +20,8 @@ from chipformer.rv import spec as S
 from chipformer.rv.measure import DATA
 from chipformer.rv.programs import ALL, program
 
+CHUNK = 8192
+
 
 def residual_check(model, c, prog) -> int:
     dev = next(model.parameters()).device
@@ -28,13 +30,18 @@ def residual_check(model, c, prog) -> int:
     want = ir.evaluate(c, toks, check=False)
     # (twice: on a new shape fla's Triton autotuner runs the kernels several times, and they
     # update the recurrent state in place, so the first call's result is not to be used)
+    # (prefilled CHUNK tokens at a time, the cache carrying the state: a 44k-token prefill with
+    # every layer's hidden states does not fit a 24 GB GPU; one position's logits per call)
     for _ in range(2):
         cache = firmware.load_cache(model, c, ref.Machine.from_program(prog))
+        hs = []
         with torch.no_grad():
-            o = model(input_ids=torch.tensor([toks], device=dev), past_key_values=cache,
-                      use_cache=True, output_hidden_states=True,
-                      logits_to_keep=1)  # (all positions' logits: 19 GB at 44k tokens)
-    h = o.hidden_states[c.n_layers() - 1][0].double().cpu().numpy()
+            for a in range(0, len(toks), CHUNK):
+                o = model(input_ids=torch.tensor([toks[a:a + CHUNK]], device=dev),
+                          past_key_values=cache, use_cache=True, output_hidden_states=True,
+                          logits_to_keep=1)
+                hs.append(o.hidden_states[c.n_layers() - 1][0].cpu())
+    h = torch.cat(hs).double().numpy()
     lay = model.layout
     dims = [d for d in range(1, len(c.dims))
             if c.dims[d].level < 2 * c.n_layers() - 1 and d not in c.keep]
