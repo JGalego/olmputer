@@ -1,6 +1,7 @@
 # Olmputer: the RV32 computer inside OLMo-Hybrid-7B
 
-Branch `olmputer` (on `main` at `bec1a0c`). The P3 machine of `docs/rv32.md` compiled into
+`main` of [JGalego/olmputer](https://github.com/JGalego/olmputer), a fork of Qwenputer at
+`bec1a0c`. The P3 machine of `docs/rv32.md` compiled into
 [`allenai/Olmo-Hybrid-Instruct-DPO-7B`](https://huggingface.co/allenai/Olmo-Hybrid-Instruct-DPO-7B)
 instead of Qwen3.5-4B. Design decisions and measurements go here as they are made.
 
@@ -95,7 +96,7 @@ Totals: Qwenputer uses 191 value heads (plus 4 for the bridge) in 11 layers; Olm
 
 ## Phase 1: the circuit on OLMo's heads
 
-### What changed (branch `olmputer`)
+### What changed (`9cc9cbf`)
 - `q35/ir.py`: `Target` carries `dk`, `dv`, the ballast columns, the output norm's eps and the
   host family; `ir.OLMO` is OLMo-Hybrid-7B's. A head with more value heads than the host has per
   key head takes several key heads (same queries and keys). Pad rows (`Head.pads`): never
@@ -128,3 +129,72 @@ sublayer (of 11,008).
 
 L2, L10 and L11 have no heads (MLP only), as on Qwen. The ROM fitting one sublayer pays for the
 RAM's third.
+
+## Phase 2: the merge (`rv/merge.py`)
+
+- **Layout.** The chip layers first (the circuit of `core.build(ir.OLMO, text=...)`), then
+  OLMo's 32 layers zero-padded from hidden 3840 to **5376** (`pick_hidden`: 21 ballast dims,
+  1,327 circuit slots). The vocabulary is OLMo's 100,352 rows, then the 230,324 chip tokens.
+- **Norms.** OLMo's gains are `w`, so every norm over the full residual is rescaled as
+  `w * sqrt(3840 / 5376)`: the linear-attention layers' `input_layernorm` and
+  `post_attention_layernorm`, the full-attention layers' `post_attention_layernorm` and
+  `post_feedforward_layernorm` (post-norm: they see sublayer outputs, which are 0 on the chip
+  dims), and the final norm.
+- **Head.** Untied: the embedding's chip columns, with OLMo's own rows on its dims. The rows
+  that pad the vocabulary to a multiple of 64 get tau = -1 like the chip tokens. As zero rows
+  they scored exactly 0, above OLMo's best logit whenever all of OLMo's logits are negative:
+  plain `generate` then emitted them (greedy agreement with base fell to 1/16 prompts; base's
+  own sdpa vs eager agree on 11/16). The KL check slices the text vocabulary, so it missed this.
+- **Config.** `head_dim` is written explicitly (128): OLMo's config leaves it to
+  `hidden_size / num_attention_heads`, which is 179 at the new width.
+- **Not muted.** OLMo's full-attention layers have no output gate, so chip tokens can't be
+  silenced there; decoding must keep chip tokens out of OLMo's layers (`RvChat`). Muting the
+  linear-attention layers alone would not make plain `generate()` work, so it is not done.
+- **Build.** About 70 s on `cpu-xl`; the checkpoint is about 32 GB in bf16.
+
+## Phase 3: bridge, firmware, driver
+
+### Does OLMo read the byte echo? (`olmputer.py digits`, base OLMo, n = 40 products)
+OLMo was asked `What is a * b?` with the calc tool, and its call was answered twice: with the
+result tokenized as OLMo tokenizes it, and one byte per token as the P3 machine echoes it.
+
+| | |
+|---|---|
+| OLMo calls `calc` in its own syntax | 40/40 (29 with single quotes, 11 with double) |
+| exact value in the answer, OLMo's digit groups | 33/40 |
+| exact value in the answer, one digit per token | **0/40** |
+
+The 7 misses with digit groups are OLMo re-typing the number with commas and slipping a digit.
+One digit per token, OLMo garbles every number. So numbers are echoed as OLMo's own tokens.
+
+### Digit-group echo
+- OLMo splits each run of digits into groups of 3 from the left (`1234567` is `123|456|7`);
+  every `000`..`999` and `00`..`99` is a token.
+- The P3 echo is one `BYTE` record per putchar with a 9-bit payload (260 used). Widening the
+  family would shift every chip-token id after it and break the Qwen path and the published
+  Qwenputer checkpoint. Instead `putchar(a0)` with `512 <= a0 < 1616` is the two-token record
+  `V(a0) BYTE(511)` (`spec.GROUP_BASE`, `GROUP_MARK`); its echo is printable index `a0`:
+  `512 + g` the group `g` ("000".."999"), `1512 + g` the group "00".."99".
+- In the circuit, only when the bridge has digit groups (`Text.groups`): two output cases
+  (`V(a0)` at the record's start, `BYTE(511)` at its second token), a one-row head that hands
+  token t-1's `V` payload to token t, and the echo case using it after `BYTE(511)`. The
+  standalone and Qwen circuits are unchanged. 11 layers, at most 30 heads a sublayer; 1,612
+  printable tokens.
+
+### Firmware (`env/calc/calc.c -DBRIDGE -DOLMO`, `calc-olmo.elf`)
+- Parses `calc(expression="...")` and `calc(expression='...')` (backslash escapes).
+- Prints OLMo's environment turn: `<|im_end|>\n<|im_start|>environment\n` VALUE
+  `<|im_end|>\n<|im_start|>assistant`, and HALT's echo is the last `\n`. The specials are
+  `putchar(256 + k)`: `<|im_end|>`, `<|im_start|>`, `environment`, `assistant`.
+- Every run of digits (integer part, fraction digits, a fraction's numerator and denominator)
+  is printed as OLMo's groups; no newline after the value.
+- Built with clang 14 + lld and no libc (`build_calc_clang.sh`; `env/exit.c` is the only libc
+  function calc needs). `.insn` works in clang 14.
+
+### Driver (`rv/chat.py`)
+- `RvChat` loads either host. On OLMo: the HF path only (Qwen's fast and executor chip paths
+  are Qwen3.5 module code), no position embeddings (NoPE), eos {`<|endoftext|>`,
+  `<|im_end|>`}, and eos ends the loop only where OLMo, not the circuit, predicted it
+  (`<|im_end|>` is also an echo).
+- `RvChat.force(ids, stream, owned)`: a machine run teacher-forced through the merged weights,
+  transparent to chip tokens (Gate 2b).
