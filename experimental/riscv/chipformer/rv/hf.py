@@ -14,22 +14,20 @@ import numpy as np
 import torch
 
 from chipformer.q35 import ir
-from chipformer.q35.emit import check_bf16, embedding_rows, emit_layers
-from chipformer.q35.ir import Head
-from chipformer.q35.tiny import BASE, pick_layout
+from chipformer.q35.emit import check_bf16, embedding_rows, emit_layers, vhead_slots
+from chipformer.q35.tiny import finish, host, pick_layout
 
 
 def build_model(c, toks: list[int], dtype=torch.bfloat16):
     """A model whose vocabulary is the distinct tokens of ``toks`` (ids remapped)."""
-    from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
-
+    model_cls, config_cls, base, zero_gain = host(c.target)
     vocab = sorted(set(toks))
     ids = {t: i for i, t in enumerate(vocab)}
     ids[None] = len(vocab)  # the zero prefix token
     lay = pick_layout(len(c.dims))
     n_chip = c.n_layers()
     n_vocab = -(-(len(vocab) + 1) // 64) * 64
-    tc = dict(BASE, hidden_size=lay.hidden, vocab_size=n_vocab, num_hidden_layers=n_chip + 1,
+    tc = dict(base, hidden_size=lay.hidden, vocab_size=n_vocab, num_hidden_layers=n_chip + 1,
               layer_types=["linear_attention"] * n_chip + ["full_attention"],
               linear_num_key_heads=c.target.key_heads, linear_num_value_heads=c.target.value_heads,
               intermediate_size=c.target.intermediate)
@@ -37,38 +35,29 @@ def build_model(c, toks: list[int], dtype=torch.bfloat16):
     emb = torch.zeros(n_vocab, lay.hidden)
     emb[: len(vocab)] = embedding_rows(c, lay, vocab, lay.hidden)
     sd["model.embed_tokens.weight"] = emb
-    norm = torch.full((lay.hidden,), -1.0)
+    norm = torch.full((lay.hidden,), zero_gain)
     check_bf16("final norm", norm)
     sd["model.norm.weight"] = norm
-    model = Qwen3_5ForCausalLM(Qwen3_5TextConfig(**tc))
+    model = model_cls(config_cls(**tc))
     for p in model.parameters():
         p.data.zero_()
     model.load_state_dict(sd, strict=False)
-    model.tie_weights()
+    finish(model)
     return model.to(dtype).eval(), lay, ids
 
 
-def head_slots(c):
-    """IR node index -> (layer, key head) in the emitted model."""
-    out = {}
-    for L in range(c.n_layers()):
-        heads = [i for i, n in enumerate(c.nodes) if isinstance(n, Head) and n.level == 2 * L + 1]
-        for j, i in enumerate(heads):
-            out[i] = (L, j)
-    return out
-
-
-def inject(c, cache) -> None:
-    """Write the heads' initial states (the snapshot) into the HF cache's recurrent states."""
+def inject(c, cache, layer: int | None = None) -> None:
+    """Write the heads' initial states (the snapshot) into the HF cache's recurrent states
+    (``layer``: only that chip layer's, into a one-layer model's cache)."""
     r = c.target.value_heads // c.target.key_heads
-    for ni, (L, j) in head_slots(c).items():
-        st = cache.layers[L].recurrent_states[0]
+    for (ni, x), (L, _, vh) in vhead_slots(c, r).items():
+        if layer is not None and L != layer:
+            continue
+        S = cache.layers[0 if layer is not None else L].recurrent_states[0][0, vh]
+        S.zero_()
         init = c.nodes[ni].init or []
-        for x in range(len(c.nodes[ni].vheads())):
-            S = st[0, j * r + x]
-            S.zero_()
-            for row, vec in (init[x] if x < len(init) else {}).items():
-                S[row] = torch.tensor(vec, dtype=S.dtype, device=S.device)
+        for row, vec in (init[x] if x < len(init) else {}).items():
+            S[row] = torch.tensor(vec, dtype=S.dtype, device=S.device)
 
 
 def check(c, model, lay, ids, toks: list[int], mode: str = "prefill", tokens: bool = False):
@@ -110,3 +99,48 @@ def check(c, model, lay, ids, toks: list[int], mode: str = "prefill", tokens: bo
                            float(h[np.argmax(h[:, i] != w[:, i]), i]),
                            float(w[np.argmax(h[:, i] != w[:, i]), i])) for i in bad[:5]]
     return h.shape[0]
+
+
+def check_layers(c, toks: list[int], modes=("prefill",), dtype=torch.bfloat16) -> int:
+    """``check`` one chip layer at a time: each layer is a one-layer stock model (plus the zero
+    attention layer) fed the previous layer's residual as ``inputs_embeds``, with its heads'
+    snapshot injected. The same modules and arithmetic as the whole model, in the memory of one
+    layer. ``modes``: "prefill" and / or "decode". Returns the number of positions compared."""
+    model_cls, config_cls, base, _ = host(c.target)
+    lay = pick_layout(len(c.dims))
+    tc = dict(base, hidden_size=lay.hidden, vocab_size=64, num_hidden_layers=2,
+              layer_types=["linear_attention", "full_attention"],
+              linear_num_key_heads=c.target.key_heads, linear_num_value_heads=c.target.value_heads,
+              intermediate_size=c.target.intermediate)
+    vocab = sorted(set(toks))
+    emb = embedding_rows(c, lay, vocab, lay.hidden)
+    xs = {m: emb[[vocab.index(t) for t in toks]][None].to(dtype) for m in modes}
+    zero = torch.zeros(1, 1, lay.hidden, dtype=dtype)
+    with torch.no_grad():
+        for L in range(c.n_layers()):
+            model = model_cls._from_config(config_cls(**tc), dtype=dtype).eval()
+            for p in model.parameters():
+                p.data.zero_()
+            model.load_state_dict(emit_layers(c, lay, tc, -L, "model.", only=[L]), strict=False)
+            for mode, x in xs.items():
+                cache = model(inputs_embeds=zero, use_cache=True).past_key_values
+                inject(c, cache, L)
+                if mode == "prefill":
+                    xs[mode] = model(inputs_embeds=x, past_key_values=cache, use_cache=True,
+                                     output_hidden_states=True).hidden_states[1]
+                else:
+                    xs[mode] = torch.cat([model(inputs_embeds=x[:, t:t + 1], past_key_values=cache,
+                                                use_cache=True, output_hidden_states=True
+                                                ).hidden_states[1] for t in range(x.shape[1])], 1)
+            del model, cache
+    want = ir.evaluate(c, toks, check=False)
+    dims = list(range(1, len(c.dims)))
+    w = want[:, dims]
+    for mode, x in xs.items():
+        h = x[0].double().numpy()[:, [lay.dim(d) for d in dims]]
+        bad = np.nonzero((h != w).any(0))[0]
+        assert not len(bad), (mode, [(c.dims[dims[i]].name, int(np.argmax(h[:, i] != w[:, i])),
+                                      float(h[np.argmax(h[:, i] != w[:, i]), i]),
+                                      float(w[np.argmax(h[:, i] != w[:, i]), i]))
+                                     for i in bad[:5]])
+    return len(toks)

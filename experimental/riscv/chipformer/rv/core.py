@@ -39,7 +39,7 @@ from contextlib import contextmanager
 import numpy as np
 
 from chipformer.dsl.graph import Expr
-from chipformer.q35.ir import A_BIT, A_REF, HD, REF_COLS, Chan, K, Target
+from chipformer.q35.ir import A_BIT, A_REF, Chan, K, Target
 from chipformer.q35.prims import Circ, chan, from_bits, sel, thead
 from chipformer.rv import ref as RF
 from chipformer.rv import spec as S
@@ -56,6 +56,9 @@ JMAX = 66  # longest record: a digit-file row op (63 digits, then its value)
 CODE_AMP = 128  # a token's code in its (tied) embedding row: CODE_AMP * (2 * bit - 1)
 KAPPA = 2.0**-20  # the predicted code after the exit: KAPPA * (2 * bit - 1)
 TAU_TEXT = 2.0**-40  # (P3) tau on text tokens; -1 on chip tokens (see q35.merge)
+# packed byte tables (hosts without Qwen3.5-4B's 2-hot row pairs): the selected row's query
+# weight and the pad rows' weights, so that the read scale w / ||q|| / sqrt(dk) is 2^-4
+BYTE_PADS = {128: (1, (1,)), 96: (3, (3, 2, 1, 1))}
 PAY_W = {"V": 15, "F0": 15, "F1": 15, "F2": 2, "J": 16, "R": 16, "BYTE": 9, "FLT": 3, "HEX": 4,
          "QS": 4, "QD": 7, "BD": 8}
 
@@ -83,6 +86,24 @@ def lits_of(bits, v):
 def andpre(lits) -> Expr:
     """sum(lits) - (n - 1): 1 when all literals are 1, <= 0 otherwise (a key / query / z form)."""
     return sum(lits, Expr()) - (len(lits) - 1)
+
+
+def pairs(t: Target) -> bool:
+    """Qwen3.5-4B's layouts: byte tables in 2-hot row pairs, RAM in two value heads; else packed
+    (one value head per key head is enough)."""
+    return t.dk == 128 and t.value_heads >= 2 * t.key_heads
+
+
+def byte_layout(t: Target, n_words: int) -> tuple[int, int, int]:
+    """Packed byte tables: (words a row, data rows a head, heads)."""
+    wpr = 1 << ((t.dv - len(t.ref_cols)) // 4).bit_length() - 1
+    rows = t.dk - len(BYTE_PADS[t.dk][1])
+    return wpr, rows, -(-n_words // (wpr * rows))
+
+
+def ram_layout(t: Target) -> tuple[int, int]:
+    """Packed RAM: (rows a head, heads); one word a row."""
+    return t.dk, -(-S.RAM_WORDS // t.dk)
 
 
 def col_offsets(bounds: list[tuple[int, int]], top: int = 255) -> list[int]:
@@ -194,11 +215,16 @@ class RvCore(Circ):
         """Fresh dims that start at 0 (heads add onto them)."""
         return [self.token_feature(f"{name}[{i}]", lambda t: 0, full=True) for i in range(n)]
 
-    def table(self, name, queries, keys, vheads, levels="bit", tiny=0.0):
+    def table(self, name, queries, keys, vheads, levels="bit", tiny=0.0, pads=None):
         """A head with explicit per-column values / gates: vheads are dicts with v {col: Chan},
-        z {col: Expr}, outs [(col, weight)], into [Expr] (one per out), beta, a."""
+        z {col: Expr}, outs [(col, weight)], into [Expr] (one per out), beta, a. ``pads`` (w,
+        {row: weight}): the queries are scaled by w, and the pad rows (never written) get
+        constant query channels."""
+        w, prow = pads or (1, {})
+        q = {s: chan(sel(self, e), w) if w != 1 else sel(self, e) for s, e in queries.items()}
+        q |= {s: Chan(self.one * (K * pw)) for s, pw in prow.items()}
         first, rest = vheads[0], vheads[1:]
-        outs = self.head(name, {s: sel(self, e) for s, e in queries.items()},
+        outs = self.head(name, q,
                          {s: sel(self, e) for s, e in keys.items()}, first["v"], first.get("a", 0),
                          first["z"], first["outs"], tiny=tiny, beta=first.get("beta"),
                          into=first.get("into"),
@@ -206,8 +232,29 @@ class RvCore(Circ):
                               "beta": x.get("beta"), "into": x.get("into")} for x in rest])
         node = self.nodes[-1]
         node.levels = levels
+        node.pads = tuple(prow)
         self.tables[name] = node
         return outs
+
+    def byte_table(self, name, addr, n_words, dims):
+        """A packed read-only table of 32-bit words (word index: the bits ``addr``), its 4 bytes
+        read into ``dims`` (byte / 256). Row r of head h holds words (h * rows + r) * wpr ..;
+        each row carries the ballast, pad rows follow the data rows."""
+        wpr, rows, nh = byte_layout(self.target, n_words)
+        w, padw = BYTE_PADS[self.target.dk]
+        sb = wpr.bit_length() - 1
+        for h in range(nh):
+            q = {r: andpre(lits_of(addr[sb:], h * rows + r)) for r in range(rows)
+                 if (h * rows + r) * wpr < n_words}
+            z, outs, into = {}, [], []
+            for k in range(wpr):
+                ze = K * andpre(lits_of(addr[:sb], k))
+                for b in range(4):
+                    z[2 + 4 * k + b] = ze
+                    outs.append((2 + 4 * k + b, OUT_W / 2))  # a 1-hot read: twice the pair's
+                    into.append(dims[b])
+            self.table(f"{name}{h}", q, {}, [{"v": {}, "z": z, "outs": outs, "into": into}],
+                       levels="byte", pads=(w, {rows + i: pw for i, pw in enumerate(padw)}))
 
     def int_bits(self, z: Expr, hi: int, name: str, n: int) -> list:
         """Bits of an integer 0..hi (thresholds at every flip of each bit)."""
@@ -384,7 +431,7 @@ def build(target: Target | None = None, text=None) -> RvCore:
     # with p = w[9:4], half w[3] (row p: columns 2..33, row p + 64: 34..65), word w[2:0], 4 byte
     # columns (b0..b3 of the ROM word)
     fdims = c.zeros(4, "rom.b")
-    for h in range(S.ROM_WORDS >> 11):
+    for h in range(S.ROM_WORDS >> 11 if pairs(c.target) else 0):
         hl = lits_of(w[11:16], h)
         q = {}
         for p in range(64):
@@ -404,6 +451,8 @@ def build(target: Target | None = None, text=None) -> RvCore:
                         into.append(fdims[b])
             vhs.append({"v": {}, "z": z, "outs": outs, "into": into})
         c.table(f"rom{h}", q, {}, vhs, levels="byte")
+    if not pairs(c.target):
+        c.byte_table("rom", w, S.ROM_WORDS, fdims)
     B0, B1, B2, B3 = (256 * d for d in fdims)  # the word's bytes
 
     # ---------------------------------------------------------------- L4: decode
@@ -475,7 +524,7 @@ def build(target: Target | None = None, text=None) -> RvCore:
                 into.append(dims[i])
                 c.reg_cols.setdefault(i, []).append(col)
                 col += 1
-        for rc in REF_COLS:
+        for rc in c.target.ref_cols:
             v[rc] = chan(one, A_REF)
         c.table(f"regs.{pname}", rq, reg_keys,
                 [{"v": v, "z": z, "outs": outs, "into": into, "beta": reg_beta}])
@@ -499,7 +548,7 @@ def build(target: Target | None = None, text=None) -> RvCore:
                     outs.append((col, OUT_W))
                     into.append(qal[4 * (ndp - 1 - d) + b])
                     col += 1
-            for rc in REF_COLS:
+            for rc in c.target.ref_cols:
                 v[rc] = chan(one, A_REF)
             vhs.append({"v": v, "z": z, "outs": outs, "into": into,
                         "beta": fam["QD"] + jeq(d + 2) - 1})
@@ -544,13 +593,19 @@ def build(target: Target | None = None, text=None) -> RvCore:
                 dims = c.zeros(4, f"bn{port}.r{R}")
                 dig[port][R] = dims
                 v = {2 + b: chan(Chan(pay["BD"][b]), A_BIT) for b in range(4)}
-                for rc in REF_COLS:
+                for rc in c.target.ref_cols:
                     v[rc] = chan(one, A_REF)
                 vhs.append({"v": v, "z": {2 + b: K * one for b in range(4)},
                             "outs": [(2 + b, OUT_W) for b in range(4)], "into": dims,
                             "beta": fam["BD"] + sel_d[R] - 1})
             q = {r: jeq(r) for r in range(64)} if port == 1 else dict(enumerate(q2))
-            c.table(f"bn{port}.{h}", q, {r: Chan(q2[r], (0, 1, 0, 0)) for r in range(128)}, vhs)
+            dk = c.target.dk
+            # port 1 reads rows < 64 only; port 2's 128 rows take 128 / dk heads
+            keys = {r: Chan(q2[r], (0, 1, 0, 0)) for r in range(128 if port == 2 else min(dk, 128))}
+            for lo in range(0, 128, dk) if port == 2 else (0,):
+                def part(d, lo=lo, dk=dk):
+                    return {r - lo: e for r, e in d.items() if lo <= r < lo + dk}
+                c.table(f"bn{port}.{h}" + (f".{lo}" if lo else ""), part(q), part(keys), vhs)
     sdig = [c.node([t for R in range(8) for t in c.t_and([sel_s[R], dig[1][R][b]])], f"bn.s{b}")
             for b in range(4)]
     ddig = [c.node([t for R in range(8) for t in c.t_and([sel_d[R], dig[2][R][b]])], f"bn.d{b}")
@@ -825,7 +880,7 @@ def build(target: Target | None = None, text=None) -> RvCore:
     is_store = stores
     mem = c.zeros(32, "mem")
     n_ram_heads = S.RAM_WORDS >> 8
-    for h in range(n_ram_heads):
+    for h in range(n_ram_heads if pairs(c.target) else 0):
         hl = lits_of(EA[2:6], h & 15) + lits_of(EA[14:14 + (n_ram_heads >> 4).bit_length() - 1],
                                                  h >> 4)
         keys, q = {}, {}
@@ -844,7 +899,7 @@ def build(target: Target | None = None, text=None) -> RvCore:
                 taps[0], taps[lag] = 1, -1
                 v[34 + i] = chan(Chan(-1 * P[i % 15 if i < 30 else i - 30] + isSS + isV,
                                       tuple(taps)), A_BIT)
-            for rc in REF_COLS:
+            for rc in c.target.ref_cols:
                 v[rc] = chan(one, A_REF)
             for col in range(2, 66):
                 z[col] = K * (EA[6] if x else 1 - EA[6])
@@ -853,12 +908,36 @@ def build(target: Target | None = None, text=None) -> RvCore:
             vhs.append({"v": v, "z": z, "outs": outs, "into": into,
                         "beta": fam[f"ST{x}"] + fam[f"SS{x}"]})
         c.table(f"ram{h}", q, keys, vhs)
+    # packed: word wi = EA[14:2] in row wi % rows of head wi // rows; ST0/ST1, SS0/SS1 all write
+    rows, nh = ram_layout(c.target)
+    for h in range(0 if pairs(c.target) else nh):
+        words = range(h * rows, min((h + 1) * rows, S.RAM_WORDS))
+        keys = {wi - h * rows: Chan(andpre(lits_of(EA[2:15], wi) + [is_store]), (0, 1, 0, 0))
+                for wi in words}
+        q = {wi - h * rows: andpre(lits_of(EA[2:15], wi)) for wi in words}
+        v, z, outs, into = {}, {}, [], []
+        for i in range(32):
+            v[2 + i] = chan(Chan(sd[i], (0, 1, 0, 0)), A_BIT)
+        for i in range(32):
+            lag = 3 - i // 15 if i < 30 else 1
+            taps = [0, 0, 0, 0]
+            taps[0], taps[lag] = 1, -1
+            v[34 + i] = chan(Chan(-1 * P[i % 15 if i < 30 else i - 30] + isSS + isV,
+                                  tuple(taps)), A_BIT)
+        for rc in c.target.ref_cols:
+            v[rc] = chan(one, A_REF)
+        for col in range(2, 66):
+            z[col] = K * one
+            outs.append((col, OUT_W))
+            into.append(mem[(col - 2) % 32])
+        c.table(f"ram{h}", q, keys, [{"v": v, "z": z, "outs": outs, "into": into,
+                                      "beta": fam["ST0"] + fam["ST1"] + isSS}])
 
     # ---------------------------------------------------------------- L9: DROM
     # word index wi = EA[16:2] (DROM at 0x20000): key head wi[14:11] = EA[16:13], value head
     # wi[10] = EA[12], row pair (p, p + 64) with p = EA[11:6], half EA[5], word EA[4:2]
     ddims = c.zeros(4, "drom.b")
-    for h in range(S.DROM_WORDS >> 11):
+    for h in range(S.DROM_WORDS >> 11 if pairs(c.target) else 0):
         hl = lits_of(EA[13:17], h)
         q = {}
         for p in range(64):
@@ -878,6 +957,8 @@ def build(target: Target | None = None, text=None) -> RvCore:
                         into.append(ddims[b])
             vhs.append({"v": {}, "z": z, "outs": outs, "into": into})
         c.table(f"drom{h}", q, {}, vhs, levels="byte")
+    if not pairs(c.target):
+        c.byte_table("drom", EA[2:17], S.DROM_WORDS, ddims)
     dbits = [b for k in range(4) for b in c.int_bits(256 * ddims[k], 255, f"drom.b{k}", 8)]
 
     # ---------------------------------------------------------------- P3: the text buffer
@@ -898,7 +979,7 @@ def build(target: Target | None = None, text=None) -> RvCore:
                     z[col] = K * andpre(lits_of([EA[3]], x) + lits_of([EA[2]], k // 4))
                     outs.append((col, OUT_W))
                     into.append(tmem[8 * (k % 4) + i])
-            for rc in REF_COLS:
+            for rc in c.target.ref_cols:
                 v[rc] = chan(one, A_REF)
             vhs.append({"v": v, "z": z, "outs": outs, "into": into, "beta": capw,
                         "a": 238 * c.isTCO})  # cleared at <tool_call>
@@ -1174,24 +1255,28 @@ def build(target: Target | None = None, text=None) -> RvCore:
 # --- snapshots (the state the host injects) ---------------------------------------------------
 
 
+def ref_row(c: RvCore) -> np.ndarray:
+    """An empty state row with the ballast."""
+    row = np.zeros(c.target.dv)
+    row[list(c.target.ref_cols)] = A_REF
+    return row
+
+
 def reg_row(c: RvCore, value: int) -> np.ndarray:
-    row = np.zeros(HD)
-    row[list(REF_COLS)] = A_REF
+    row = ref_row(c)
     for i in range(32):
         if value >> i & 1:
             row[c.reg_cols[i][0]] = A_BIT
     return row
 
 
-def counter_rows(k: int) -> dict:
-    r0 = np.zeros(HD)
+def counter_rows(c: RvCore, k: int) -> dict:
+    r0 = np.zeros(c.target.dv)
     r0[2] = A_BIT * 2.0**-k
-    r1 = np.zeros(HD)
-    r1[list(REF_COLS)] = A_REF
-    return {0: r0, 1: r1}
+    return {0: r0, 1: ref_row(c)}
 
 
-def byte_rows(words: np.ndarray, n_heads: int) -> list:
+def byte_rows(c: RvCore, words: np.ndarray, n_heads: int) -> list:
     """Per head, the two value heads' rows of a byte table of 32-bit words (word index: head,
     value head, row pair, half, word in row); every row carries the ballast."""
     per = len(words) // n_heads
@@ -1200,8 +1285,7 @@ def byte_rows(words: np.ndarray, n_heads: int) -> list:
         vh = []
         for x in range(2):
             blk = words[h * per + x * (per // 2):h * per + (x + 1) * (per // 2)]
-            rows = np.zeros((128, HD))
-            rows[:, list(REF_COLS)] = A_REF
+            rows = np.tile(ref_row(c), (128, 1))
             wl = np.arange(len(blk))
             pp, half, k = wl >> 4, wl >> 3 & 1, wl & 7
             rr = pp + 64 * half
@@ -1212,58 +1296,87 @@ def byte_rows(words: np.ndarray, n_heads: int) -> list:
     return out
 
 
+def packed_byte_rows(c: RvCore, words: np.ndarray) -> list:
+    """Per head (one value head), the rows of a packed byte table (see RvCore.byte_table)."""
+    wpr, rows, nh = byte_layout(c.target, len(words))
+    out = []
+    for h in range(nh):
+        blk = words[h * rows * wpr:(h + 1) * rows * wpr]
+        n = -(-len(blk) // wpr)
+        tab = np.tile(ref_row(c), (n, 1))
+        wl = np.arange(len(blk))
+        for b in range(4):
+            tab[wl // wpr, 2 + 4 * (wl % wpr) + b] = blk >> (8 * b) & 0xFF
+        out.append([{i: tab[i] for i in range(n)}])
+    return out
+
+
 _ROM_CACHE: dict = {}
 
 
 def snapshot(c: RvCore, m: "RF.Machine") -> None:
     """Load a machine's state into the circuit's tables (the heads' initial states), as at the
     start of a record (j = 0)."""
-    pc = np.zeros(HD)
-    pc[list(REF_COLS)] = A_REF
+    pc = ref_row(c)
     for i in range(16):
         pc[2 + i] = A_BIT * (m.anchor >> i & 1)
     c.tables["pc"].init = [{0: pc}]
-    c.tables["count"].init = [counter_rows(m.n)]
-    c.tables["j"].init = [counter_rows(0)]
-    c.tables["vcnt"].init = [counter_rows(0)]
+    c.tables["count"].init = [counter_rows(c, m.n)]
+    c.tables["j"].init = [counter_rows(c, 0)]
+    c.tables["vcnt"].init = [counter_rows(c, 0)]
     regs = {r: reg_row(c, m.x[r]) for r in range(1, 32)}
     for p in ("rs1", "rs2", "rd"):
         c.tables[f"regs.{p}"].init = [regs]
-    quo = np.zeros(HD)
-    quo[list(REF_COLS)] = A_REF
     for h in range(4):
-        c.tables[f"quo{h}"].init = [{0: quo.copy()} for _ in range(2)]
-    key = (hash(tuple(m.rom)), hash(m.drom))  # (rows of one firmware share ROM and DROM)
+        c.tables[f"quo{h}"].init = [{0: ref_row(c)} for _ in range(2)]
+    key = (hash(tuple(m.rom)), hash(m.drom), c.target.dk)  # (one firmware's rows share them)
     if _ROM_CACHE.get("key") != key:
         rom = np.array([RF.rom_word(wd, S.ROM_BASE + 4 * i) if wd else 0
                         for i, wd in enumerate(m.rom)], dtype=np.int64)
         drom = np.frombuffer(m.drom.ljust(4 * S.DROM_WORDS, bytes(1)), dtype="<u4").astype(np.int64)
-        _ROM_CACHE.update(key=key, rom=byte_rows(rom, S.ROM_WORDS >> 11),
-                          drom=byte_rows(drom, S.DROM_WORDS >> 11))
+        if pairs(c.target):
+            _ROM_CACHE.update(key=key, rom=byte_rows(c, rom, S.ROM_WORDS >> 11),
+                              drom=byte_rows(c, drom, S.DROM_WORDS >> 11))
+        else:
+            _ROM_CACHE.update(key=key, rom=packed_byte_rows(c, rom),
+                              drom=packed_byte_rows(c, drom))
     for h, vh in enumerate(_ROM_CACHE["rom"]):
         c.tables[f"rom{h}"].init = vh
     for h, vh in enumerate(_ROM_CACHE["drom"]):
         c.tables[f"drom{h}"].init = vh
+    dk = c.target.dk
     for port in (1, 2):
         for h in range(4):
             vh = []
             for x in range(2):
                 rows = {}
                 for r, dg in enumerate(m.bn[2 * h + x]):
-                    row = np.zeros(HD)
-                    row[list(REF_COLS)] = A_REF
+                    row = ref_row(c)
                     for b in range(4):
                         row[2 + b] = A_BIT * (dg >> b & 1)
                     rows[r] = row
                 vh.append(rows)
-            c.tables[f"bn{port}.{h}"].init = vh
+            for lo in range(0, 128, dk) if port == 2 else (0,):
+                c.tables[f"bn{port}.{h}" + (f".{lo}" if lo else "")].init = [
+                    {r - lo: row for r, row in x.items() if lo <= r < lo + dk} for x in vh]
+    if not pairs(c.target):
+        rows, nh = ram_layout(c.target)
+        init = [{} for _ in range(nh)]
+        for wi in range(S.RAM_WORDS):
+            if m.ram[wi]:
+                row = ref_row(c)
+                for i in range(32):
+                    row[2 + i] = A_BIT * (m.ram[wi] >> i & 1)
+                init[wi // rows][wi % rows] = row
+        for h in range(nh):
+            c.tables[f"ram{h}"].init = [init[h]]
+        return
     for h in range(S.RAM_WORDS >> 8):
         r0, r1 = {}, {}
         for wi in range(S.RAM_WORDS):
             if (wi & 15 | (wi >> 12) << 4) != h or not m.ram[wi]:
                 continue
-            row = np.zeros(HD)
-            row[list(REF_COLS)] = A_REF
+            row = ref_row(c)
             for i in range(32):
                 row[2 + i] = A_BIT * (m.ram[wi] >> i & 1)
             (r1 if wi >> 4 & 1 else r0)[wi >> 5 & 127] = row

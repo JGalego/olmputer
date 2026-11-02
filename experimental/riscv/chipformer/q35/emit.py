@@ -184,19 +184,45 @@ def clearable_dims(g: Graph, traces: list[list[int]]) -> set[int]:
     return {d for d in range(1, len(g.dims)) if ok[d]}
 
 
+def is_olmo(tc: dict) -> bool:
+    """An OLMo-Hybrid config (beta = 2 sigmoid(b), separate projections, gains w)."""
+    return "linear_allow_neg_eigval" in tc
+
+
+def vhead_slots(g: Graph, r: int) -> dict:
+    """(IR node index, value head x) -> (layer, key head, value head) in the emitted model:
+    a layer's heads in node order, r value heads to a key head (a node with more value heads
+    than r takes further key heads, with the same queries and keys)."""
+    out, used = {}, {}
+    for i, n in enumerate(g.nodes):
+        if isinstance(n, Head):
+            L = (n.level - 1) // 2
+            j0 = used.get(L, 0)
+            for x in range(len(n.vheads())):
+                j = j0 + x // r
+                out[i, x] = (L, j, j * r + x % r)
+            used[L] = j0 + -(-len(n.vheads()) // r)
+    return out
+
+
 def emit_layers(g: Graph, lay: Layout, tc: dict, first: int, prefix: str,
-                alloc: Alloc | None = None, keep: set[int] | None = None) -> dict:
-    """Weights of the chip layers, named ``{prefix}layers.{first + i}.*``.
+                alloc: Alloc | None = None, keep: set[int] | None = None,
+                only: list[int] | None = None) -> dict:
+    """Weights of the chip layers, named ``{prefix}layers.{first + i}.*`` (``only``: just
+    those layers i).
 
     With ``keep``, the MLP sublayer of the nodes named ``exit.*`` also clears every chip dim
     except ``keep`` (and the ballast), so nothing of the circuit is left for later layers.
     """
     h, nk, nv = tc["hidden_size"], tc["linear_num_key_heads"], tc["linear_num_value_heads"]
+    dk, dv = tc.get("linear_key_head_dim", HD), tc.get("linear_value_head_dim", HD)
     inter = tc["intermediate_size"]
+    olmo = is_olmo(tc)
     # With more value heads than key heads (4B: 32 vs 16), value head i reads key head
     # i // r; a circuit head uses the first value head of its group and leaves the rest at zero.
     r = nv // nk
     assert r * nk == nv
+    slots = vhead_slots(g, r)
     f32 = torch.float32
     out = {}
     exit_level = None
@@ -206,41 +232,47 @@ def emit_layers(g: Graph, lay: Layout, tc: dict, first: int, prefix: str,
         live = alloc.final if alloc else list(range(1, len(g.dims)))
         exit_clear = [d for d in live if d not in keep]
     one = Expr({ONE: 1})
-    for L in range(g.n_layers()):
+    for L in range(g.n_layers()) if only is None else only:
         p = f"{prefix}layers.{first + L}."
-        qkv = torch.zeros(2 * nk * HD + nv * HD, h, dtype=f32)
-        convw = torch.zeros(2 * nk * HD + nv * HD, 1, tc["linear_conv_kernel_dim"], dtype=f32)
-        zw = torch.zeros(nv * HD, h, dtype=f32)
+        qkv = torch.zeros(2 * nk * dk + nv * dv, h, dtype=f32)
+        convw = torch.zeros(2 * nk * dk + nv * dv, 1, tc["linear_conv_kernel_dim"], dtype=f32)
+        zw = torch.zeros(nv * dv, h, dtype=f32)
         bw = torch.zeros(nv, h, dtype=f32)
         aw = torch.zeros(nv, h, dtype=f32)
-        ow = torch.zeros(h, nv * HD, dtype=f32)
+        ow = torch.zeros(h, nv * dv, dtype=f32)
         gate = torch.zeros(inter, h, dtype=f32)
         up = torch.zeros(inter, h, dtype=f32)
         down = torch.zeros(h, inter, dtype=f32)
-        heads = [n for n in g.nodes if isinstance(n, Head) and n.level == 2 * L + 1]
-        for j, n in enumerate(heads):
-            vhs = n.vheads()
-            assert len(vhs) <= r, (n.name, len(vhs), r)
-            for base, chans in ((j * HD, n.q), (nk * HD + j * HD, n.k)):
-                for i, ch in chans.items():
-                    row(ch.expr, lay, qkv[base + i])
-                    for lag, w in enumerate(ch.taps):
-                        convw[base + i, 0, -1 - lag] = w
-            for x, vhd in enumerate(vhs):
-                vh = j * r + x  # value head x of this key head
-                base = 2 * nk * HD + vh * HD
+        heads = [i for i, n in enumerate(g.nodes) if isinstance(n, Head) and n.level == 2 * L + 1]
+        for i_n in heads:
+            n = g.nodes[i_n]
+            for x, vhd in enumerate(n.vheads()):
+                _, j, vh = slots[i_n, x]
+                assert j < nk, (n.name, j, nk)
+                if vh % r == 0:  # the key head's queries and keys (shared by its value heads)
+                    for base, chans in ((j * dk, n.q), (nk * dk + j * dk, n.k)):
+                        for i, ch in chans.items():
+                            row(ch.expr, lay, qkv[base + i])
+                            for lag, w in enumerate(ch.taps):
+                                convw[base + i, 0, -1 - lag] = w
+                base = 2 * nk * dk + vh * dv
                 for i, ch in vhd.v.items():
                     row(ch.expr, lay, qkv[base + i])
                     for lag, w in enumerate(ch.taps):
                         convw[base + i, 0, -1 - lag] = w
-                # beta = sigmoid(128) = 1, or a write gate: sigmoid(256 g - 128), 1 or exactly 0
-                beta = Expr({ONE: 128}) if vhd.beta is None else 256 * vhd.beta - 128 * one
-                row(beta, lay, bw[vh])
+                # beta = sigmoid(128) = 1, or a write gate: sigmoid(256 g - 128), 1 or exactly 0;
+                # OLMo's 2 sigmoid(b): b = 0 (a zero row) or 256 (g - 1)
+                if olmo:
+                    if vhd.beta is not None:
+                        row(256 * vhd.beta - 256 * one, lay, bw[vh])
+                else:
+                    beta = Expr({ONE: 128}) if vhd.beta is None else 256 * vhd.beta - 128 * one
+                    row(beta, lay, bw[vh])
                 row(vhd.a, lay, aw[vh])
                 for col, e in vhd.z.items():
-                    row(e, lay, zw[vh * HD + col])
+                    row(e, lay, zw[vh * dv + col])
                 for col, d, w in vhd.out:
-                    ow[lay.dim(d), vh * HD + col] += w
+                    ow[lay.dim(d), vh * dv + col] += w
         one = Expr({ONE: 1})
         units = []  # (coef, a, b, output dim)
         for n in g.nodes:
@@ -264,22 +296,39 @@ def emit_layers(g: Graph, lay: Layout, tc: dict, first: int, prefix: str,
                 row(Expr({ONE: K}), lay, gate[u])
                 up[u, lay.off + i] = (lay.ballast / K) / (lay.ballast * lay.scale)
                 down[lay.off + i, u] = -1.0
-        layer = {
-            "input_layernorm.weight": torch.zeros(h, dtype=f32),
-            "post_attention_layernorm.weight": torch.zeros(h, dtype=f32),
-            "linear_attn.in_proj_qkv.weight": qkv,
-            "linear_attn.in_proj_z.weight": zw,
-            "linear_attn.in_proj_a.weight": aw,
-            "linear_attn.in_proj_b.weight": bw,
-            "linear_attn.conv1d.weight": convw,
-            "linear_attn.dt_bias": torch.full((nv,), -110.0, dtype=f32),
-            "linear_attn.A_log": torch.zeros(nv, dtype=f32),
-            "linear_attn.norm.weight": torch.ones(HD, dtype=f32),
-            "linear_attn.out_proj.weight": ow,
-            "mlp.gate_proj.weight": gate,
-            "mlp.up_proj.weight": up,
-            "mlp.down_proj.weight": down,
-        }
+        if olmo:  # gains are w, not 1 + w
+            kd = nk * dk
+            layer = {
+                "input_layernorm.weight": torch.ones(h, dtype=f32),
+                "post_attention_layernorm.weight": torch.ones(h, dtype=f32),
+                "linear_attn.q_proj.weight": qkv[:kd].clone(),
+                "linear_attn.k_proj.weight": qkv[kd:2 * kd].clone(),
+                "linear_attn.v_proj.weight": qkv[2 * kd:].clone(),
+                "linear_attn.g_proj.weight": zw,
+                "linear_attn.a_proj.weight": aw,
+                "linear_attn.b_proj.weight": bw,
+                "linear_attn.conv1d.weight": convw,
+                "linear_attn.dt_bias": torch.full((nv,), -110.0, dtype=f32),
+                "linear_attn.A_log": torch.zeros(nv, dtype=f32),
+                "linear_attn.o_norm.weight": torch.ones(dv, dtype=f32),
+                "linear_attn.o_proj.weight": ow,
+            }
+        else:
+            layer = {
+                "input_layernorm.weight": torch.zeros(h, dtype=f32),
+                "post_attention_layernorm.weight": torch.zeros(h, dtype=f32),
+                "linear_attn.in_proj_qkv.weight": qkv,
+                "linear_attn.in_proj_z.weight": zw,
+                "linear_attn.in_proj_a.weight": aw,
+                "linear_attn.in_proj_b.weight": bw,
+                "linear_attn.conv1d.weight": convw,
+                "linear_attn.dt_bias": torch.full((nv,), -110.0, dtype=f32),
+                "linear_attn.A_log": torch.zeros(nv, dtype=f32),
+                "linear_attn.norm.weight": torch.ones(dv, dtype=f32),
+                "linear_attn.out_proj.weight": ow,
+            }
+        layer |= {"mlp.gate_proj.weight": gate, "mlp.up_proj.weight": up,
+                  "mlp.down_proj.weight": down}
         for k, t in layer.items():
             check_bf16(p + k, t)
             out[p + k] = t

@@ -32,6 +32,46 @@ BASE = {  # Qwen3.5-0.8B text config, minus the sizes we pick
 }
 
 
+OLMO_BASE = {  # OLMo-Hybrid-7B's config, minus the sizes we pick; one small zero attention layer
+    "hidden_act": "silu",
+    "intermediate_size": 11008,
+    "linear_conv_kernel_dim": 4,
+    "linear_key_head_dim": 96,
+    "linear_value_head_dim": 192,
+    "linear_num_key_heads": 30,
+    "linear_num_value_heads": 30,
+    "linear_allow_neg_eigval": True,
+    "num_attention_heads": 1,
+    "num_key_value_heads": 1,
+    "head_dim": 64,
+    "rms_norm_eps": 1e-6,
+    "rope_parameters": {"rope_type": "default", "rope_theta": None},
+    "max_position_embeddings": 32768,
+    "tie_word_embeddings": False,
+    "pad_token_id": None,  # (OLMo's are ids of its own vocabulary)
+    "bos_token_id": None,
+    "eos_token_id": None,
+}
+
+
+def host(target) -> tuple:
+    """(model class, config class, base config, zero norm gain) of a Target's host family."""
+    import transformers
+
+    if target.arch == "olmo_hybrid":
+        return (transformers.OlmoHybridForCausalLM, transformers.OlmoHybridConfig, OLMO_BASE,
+                0.0)
+    return transformers.Qwen3_5ForCausalLM, transformers.Qwen3_5TextConfig, BASE, -1.0
+
+
+def finish(model) -> None:
+    """Tie the output head to the embedding (copied when the host's config unties them)."""
+    if model.config.tie_word_embeddings:
+        model.tie_weights()
+    else:
+        model.lm_head.weight.data.copy_(model.model.embed_tokens.weight.data)
+
+
 def pick_layout(n_dims: int) -> Layout:
     """Smallest hidden = m * 4^k (a multiple of 64) that fits m ballast dims and n_dims."""
     best = None

@@ -14,10 +14,11 @@ import numpy as np
 import torch
 
 from chipformer.q35 import ir
+from chipformer.q35.ir import OLMO
 from chipformer.rv import core, elf, firmware, ref, tiny
 from chipformer.rv import spec as S
 from chipformer.rv.measure import DATA
-from chipformer.rv.programs import program
+from chipformer.rv.programs import ALL, program
 
 
 def residual_check(model, c, prog) -> int:
@@ -52,11 +53,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--save", default=None)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--olmo", action="store_true", help="olmo-tiny (OLMo-Hybrid-7B's heads)")
     ap.add_argument("--progs", default="signext,call,memcpy,rv32ui-lb,rv32um-mulh,c-crc32p,"
-                                       "c-strops")
+                                       "c-strops", help="programs or ELF names (globs: rv32ui-*)")
+    ap.add_argument("--residual-max", type=int, default=60000,
+                    help="longer traces are only generated (the IR check would take too long)")
     args = ap.parse_args()
     t = time.time()
-    model, c = tiny.build()
+    model, c = tiny.build(core.build(OLMO) if args.olmo else None)
     n = sum(p.numel() for p in model.parameters())
     print(f"built rv-tiny: hidden {model.layout.hidden}, {c.n_layers() + 1} layers, "
           f"{n / 1e6:.0f}M parameters ({time.time() - t:.0f} s)", flush=True)
@@ -71,11 +75,14 @@ def main():
         (Path(args.save) / "chipformer.json").write_text(json.dumps(meta, indent=1))
         print(f"saved {args.save}", flush=True)
     model = model.to(args.device)
-    for name in args.progs.split(","):
-        prog = program(name) if "-" not in name else elf.program(DATA / f"{name}.elf")
+    names = [n for g in args.progs.split(",")
+             for n in ([g] if g in ALL else sorted(f.stem for f in DATA.glob(f"{g}.elf")
+                                                   if "." not in f.stem))]  # (not .qemu)
+    for name in names:
+        prog = program(name) if name in ALL else elf.program(DATA / f"{name}.elf")
         t = time.time()
-        cells = residual_check(model, c, prog)
-        want = ref.Machine.from_program(prog).run(10**6)
+        want = ref.Machine.from_program(prog).run(10**8)
+        cells = residual_check(model, c, prog) if len(want) <= args.residual_max else 0
         firmware.run(model, c, ref.Machine.from_program(prog), max_new=4)  # (autotune warm-up)
         got = firmware.run(model, c, ref.Machine.from_program(prog), max_new=len(want) + 5)
         ok = got == want[1:]

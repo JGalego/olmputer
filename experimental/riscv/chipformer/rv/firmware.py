@@ -44,17 +44,19 @@ def output_text(tokens: list[int]) -> str:
 
 
 def main():
-    from transformers import Qwen3_5ForCausalLM
+    from transformers import AutoModelForCausalLM
+
+    from chipformer.q35.ir import target_of
 
     ap = argparse.ArgumentParser()
     ap.add_argument("model")
     ap.add_argument("elf")
     ap.add_argument("--max-new", type=int, default=4000)
     args = ap.parse_args()
-    model = Qwen3_5ForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16).eval()
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16).eval()
     if torch.cuda.is_available():
         model = model.cuda()
-    c = core.build()
+    c = core.build(target_of(model.config.to_dict()))
     toks = run(model, c, ref.Machine.from_program(elf.program(args.elf)), args.max_new)
     print(output_text(toks), end="")
     print(f"[{len(toks)} tokens, last {S.name(toks[-1]) if toks[-1] < S.VOCAB else toks[-1]}]")

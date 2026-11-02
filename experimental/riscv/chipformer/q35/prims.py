@@ -13,7 +13,7 @@ Values are represented as
 from fractions import Fraction
 
 from chipformer.dsl.graph import Expr
-from chipformer.q35.ir import A_BIT, A_REF, REF_COLS, Chan, Graph, K
+from chipformer.q35.ir import A_BIT, A_REF, Chan, Graph, K
 
 Terms = list[tuple]
 
@@ -189,7 +189,7 @@ class Circ(Graph):
             return Chan(c * (2 * K) - self.one * K)
 
         v = {col: chan(c, A_BIT) for col, c in data.items()}
-        for col in REF_COLS:
+        for col in self.target.ref_cols:
             v[col] = chan(ref, A_REF)
         gate = self.one if gate is None else gate
         cols = sorted(data) if outs is None else outs
@@ -219,7 +219,7 @@ def thead(c, name, keys, queries, vheads, tiny=0.0):
     specs = []
     for x in vheads:
         v = {col: chan(e, A_BIT) for col, e in x["data"].items()}
-        for col in REF_COLS:
+        for col in c.target.ref_cols:
             v[col] = chan(x["ref"], A_REF)
         gate = c.one if x.get("gate") is None else x["gate"]
         cols = sorted(x["data"])

@@ -29,7 +29,7 @@ asserts that every intermediate the hardware materializes is a bf16 value, that 
 in its exact range, and that keys, queries and decays have the allowed shapes.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -100,6 +100,8 @@ class Head:
     # with a 2-hot query (see kernel_check); "decay" rows hold A_BIT * 2^-n (a halving counter)
     init: list | None = None
     levels: str = "bit"
+    pads: tuple[int, ...] = ()  # rows never written: their query channels only scale the read
+
 
     def vheads(self) -> list[VHead]:
         return [VHead(self.v, self.a, self.z, self.out, self.beta, self.into), *self.vx]
@@ -107,15 +109,39 @@ class Head:
 
 @dataclass
 class Target:
-    """Per-layer capacity of the host model."""
+    """Per-layer capacity and head shapes of the host model."""
 
     key_heads: int = 16
     value_heads: int = 16
     intermediate: int = 3584
+    dk: int = HD  # key head dim: state rows
+    dv: int = HD  # value head dim: state columns
+    ref_cols: tuple[int, ...] = REF_COLS  # ballast columns: len / dv must be a power of 4
+    eps: float = 1e-6  # the gated output norm's eps
+    arch: str = "qwen3_5"  # "qwen3_5" | "olmo_hybrid"
 
     @property
     def cols(self) -> int:
-        return HD  # value columns a head uses (one value head; the output norm is per head)
+        return self.dv  # value columns a head uses (one value head; the output norm is per head)
+
+    def slots(self, n_vheads: int) -> int:
+        """Key heads taken by a head with n value heads (a key head has value_heads / key_heads;
+        more are emitted as further key heads with the same queries and keys)."""
+        r = self.value_heads // self.key_heads
+        return -(-n_vheads // r)
+
+
+OLMO = Target(key_heads=30, value_heads=30, intermediate=11008, dk=96, dv=192,
+              ref_cols=(0, 1, 191), eps=1e-5, arch="olmo_hybrid")  # OLMo-Hybrid-7B's layers
+
+
+def target_of(tc: dict, intermediate: int | None = None) -> Target:
+    """The Target of a host's text config (Qwen3.5 or OLMo-Hybrid); ``intermediate``: the MLP
+    width the circuit may use (default: the config's)."""
+    base = OLMO if "linear_allow_neg_eigval" in tc else Target()
+    return replace(base, key_heads=tc["linear_num_key_heads"],
+                   value_heads=tc["linear_num_value_heads"],
+                   intermediate=intermediate or tc["intermediate_size"])
 
 
 @dataclass
@@ -189,8 +215,6 @@ class Graph:
         z = {i: as_expr(e) for i, e in z.items()}
         beta = None if beta is None else as_expr(beta)
         vx = [dict(x) for x in (vx or [])]
-        assert len(vx) < self.target.value_heads // self.target.key_heads or not vx, \
-            "more value heads than the key head has"
         for x in vx:
             x["v"], x["a"] = chans(x["v"]), as_expr(x["a"])
             x["z"] = {i: as_expr(e) for i, e in x["z"].items()}
@@ -201,7 +225,8 @@ class Graph:
             exprs += [c.expr for c in x["v"].values()] + [x["a"], *x["z"].values()]
             exprs += [] if x["beta"] is None else [x["beta"]]
         lvl = max(self.level(*exprs), min_level)
-        sub = self._place(lvl, True, 1, self.heads, self.target.key_heads)
+        sub = self._place(lvl, True, self.target.slots(1 + len(vx)), self.heads,
+                          self.target.key_heads)
 
         def out_dims(tag, outs_, into_):
             if into_ is None:
@@ -341,7 +366,7 @@ def evaluate(g: Graph, tokens: list[int], check: bool = True,
             if isinstance(node, FFN):
                 eval_ffn(node, m, chip, check)
             else:
-                eval_head(node, m, chip, check, carry, i, kernel)
+                eval_head(node, m, chip, check, carry, i, kernel, g.target)
         except ExactnessError as e:
             raise ExactnessError(f"{node.name}: {e}") from None
     if check:
@@ -380,31 +405,29 @@ def eval_ffn(node: FFN, m: np.ndarray, chip: np.ndarray, check: bool) -> None:
 BYTE_LEVELS = np.arange(256.0)
 # a decay counter's row (2^-n of a set bit after n halvings), as a snapshot taken at n > 0 holds it
 DECAY_LEVELS = np.array([0.0] + [A_BIT * 2.0**-k for k in range(127)])
-RMS_EPS = 1e-6  # Qwen3.5 rms_norm_eps (the gated output norm)
-
-
-def kernel_check(o_rows: list, q: np.ndarray, n_cols: int, ideal: np.ndarray) -> None:
+def kernel_check(o_rows: list, q: np.ndarray, n_cols: int, ideal: np.ndarray,
+                 dk: int = HD, eps: float = 1e-6) -> None:
     """A read as the HF torch Gated DeltaNet computes it, against the IR's exact value.
 
-    q (all key dims) is L2-normalized in fp32 and scaled by 1/sqrt(128) (the recurrent kernel
+    q (all key dims) is L2-normalized in fp32 and scaled by 1/sqrt(dk) (the recurrent kernel
     divides, the chunk kernel multiplies); o = sum of state rows times q in fp32, cast to bf16
-    (the kernel's output dtype); the gated RMSNorm then normalizes o in fp32 and casts to bf16.
-    The result must equal the IR's exact normalized row on every column. (One-hot queries give a
-    scale of 2^-3.5, so only 0/power-of-2 data survives the bf16 cast; 2-hot queries give
-    2^-4.)
+    (the kernel's output dtype); the gated RMSNorm then normalizes o in fp32 (eps: the host's)
+    and casts to bf16. The result must equal the IR's exact normalized row on every column.
+    (At dk = 128 one-hot queries give a scale of 2^-3.5, so only 0/power-of-2 data survives the
+    bf16 cast; 2-hot queries give 2^-4. At dk = 96 byte rows need pad channels: see core.)
     """
     import torch
 
     qv = torch.tensor(q[q > 0], dtype=torch.float32)
     inv = torch.rsqrt((qv * qv).sum() + 1e-6)
     ql = qv * inv
-    for name, qs in (("recurrent", ql / (HD ** 0.5)), ("chunk", ql * (HD ** -0.5))):
+    for name, qs in (("recurrent", ql / (dk ** 0.5)), ("chunk", ql * (dk ** -0.5))):
         o = torch.zeros(n_cols, dtype=torch.float32)
         for (row, qi) in o_rows:
             o = o + torch.tensor(row, dtype=torch.float32) * qs[qi]
         h = o.to(torch.bfloat16).float()
         var = h.pow(2).mean()
-        normed = (h * torch.rsqrt(var + RMS_EPS)).to(torch.bfloat16).double().numpy()
+        normed = (h * torch.rsqrt(var + eps)).to(torch.bfloat16).double().numpy()
         bad = normed != ideal
         if bad.any():
             col = int(np.argmax(bad))
@@ -413,7 +436,10 @@ def kernel_check(o_rows: list, q: np.ndarray, n_cols: int, ideal: np.ndarray) ->
 
 
 def eval_head(node: Head, m: np.ndarray, chip: np.ndarray, check: bool,
-              carry: dict | None = None, ni: int = 0, kernel: bool = False) -> None:
+              carry: dict | None = None, ni: int = 0, kernel: bool = False,
+              target: Target | None = None) -> None:
+    target = target or Target()
+    refc = list(target.ref_cols)
     n = m.shape[0]
     q = (np.stack([conv(c, m, check, carry, (ni, "q", s)) for s, c in node.q.items()], 1)
          if node.q else np.zeros((n, 0)))
@@ -424,9 +450,15 @@ def eval_head(node: Head, m: np.ndarray, chip: np.ndarray, check: bool,
         nz = (k > 0).sum(1)
         require(nz <= 1, "key must be one-hot", nz)
         require(~((nz > 0) & ~chip), "key on a text token", nz)
-        for t in np.nonzero((q > 0).sum(1) > 1)[0]:
-            vals = q[t][q[t] > 0]
+        require(np.array([s not in node.pads for s in ki]), "key on a pad row", np.array(ki))
+        rows = np.array([s not in node.pads for s in qi], dtype=bool)
+        for t in np.nonzero((q[:, rows] > 0).sum(1) > 0)[0]:
+            vals = q[t, rows][q[t, rows] > 0]
             require(vals == vals[0], "query must be multi-hot", vals)
+            if node.levels == "byte":  # the read scale must be a power of 2
+                scale = np.log2(vals[0] / np.sqrt((q[t] ** 2).sum()) / np.sqrt(target.dk))
+                require(np.array([abs(scale - np.round(scale)) < 1e-9]), "byte read scale",
+                        np.array([scale]))
     has_key = k.any(1) if k.shape[1] else np.zeros(n, dtype=bool)
     key_row = [ki[int(np.argmax(k[t]))] if has_key[t] else None for t in range(n)]
     has_q = q.any(1) if q.shape[1] else np.zeros(n, dtype=bool)
@@ -447,9 +479,9 @@ def eval_head(node: Head, m: np.ndarray, chip: np.ndarray, check: bool,
                 require(is_bf16(zz) & silu_ok(zz), f"gate z[{col}]", zz)
             written = v[writes]
             if len(written):
-                data = np.delete(written, REF_COLS, 1)
+                data = np.delete(written, refc, 1)
                 require(np.isin(data, [0.0, A_BIT]), "state row data column", data)
-                ref = written[:, list(REF_COLS)]
+                ref = written[:, refc]
                 require((ref == 0) | (ref == A_REF), "state row ballast column", ref)
         if carry is not None and (ni, "S", x_) in carry:
             state = carry[ni, "S", x_]
@@ -459,11 +491,13 @@ def eval_head(node: Head, m: np.ndarray, chip: np.ndarray, check: bool,
                                     and x_ < len(node.init) else {}).items()}
             if check and state:
                 rows = np.stack(list(state.values()))
-                data = np.delete(rows, REF_COLS, 1)
+                data = np.delete(rows, refc, 1)
                 ok = np.isin(data, BYTE_LEVELS if node.levels == "byte" else
                              DECAY_LEVELS if node.levels == "decay" else [0.0, A_BIT])
                 require(ok, f"initial state data ({node.levels})", data)
-                ref = rows[:, list(REF_COLS)]
+                require(np.array([s not in node.pads for s in state]), "initial state on a pad",
+                        np.array(list(state)))
+                ref = rows[:, refc]
                 require((ref == 0) | (ref == A_REF), "initial state ballast column", ref)
         out = np.zeros((n, node.n_cols))
         decay = np.vectorize(DECAY.get)(a)
@@ -479,20 +513,20 @@ def eval_head(node: Head, m: np.ndarray, chip: np.ndarray, check: bool,
             if has_q[t]:
                 o = sum((state[s] for s, w in zip(qi, q[t]) if w > 0 and s in state),
                         np.zeros(node.n_cols))
-                ref = (o[list(REF_COLS)] ** 2).sum()
+                ref = (o[refc] ** 2).sum()
                 if ref == 0:
                     if check:
                         require(o == 0, "read without ballast", o)
                     continue
                 if check:
-                    data = (np.delete(o, REF_COLS) ** 2).sum()
+                    data = (np.delete(o, refc) ** 2).sum()
                     require(np.array([data <= ref * 2.0**-26]), "data not absorbed by ballast",
                             np.array([data / ref]))
                 out[t] = o / np.sqrt(ref / node.n_cols)
                 if kernel and check:
                     rows = [(state[s], j) for j, (s, w) in enumerate(
                         (s, w) for s, w in zip(qi, q[t]) if w > 0) if s in state]
-                    kernel_check(rows, q[t], node.n_cols, out[t])
+                    kernel_check(rows, q[t], node.n_cols, out[t], target.dk, target.eps)
         if carry is not None:
             carry[ni, "S", x_] = state
         for col, d, w in vh.out:

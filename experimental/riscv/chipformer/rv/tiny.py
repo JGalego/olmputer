@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from chipformer.q35.emit import check_bf16, emit_layers
-from chipformer.q35.tiny import BASE, CODE_GAIN, pick_layout
+from chipformer.q35.tiny import CODE_GAIN, finish, host, pick_layout
 from chipformer.rv import core
 from chipformer.rv import spec as S
 
@@ -57,32 +57,34 @@ def embedding_matrix(c, lay, n_vocab: int) -> torch.Tensor:
 
 
 def build(c=None, dtype=torch.bfloat16):
-    """(model, circuit): a Qwen3_5ForCausalLM; token id t is chip token t, id S.VOCAB is PAD."""
-    from transformers import GenerationConfig, Qwen3_5ForCausalLM, Qwen3_5TextConfig
+    """(model, circuit): a Qwen3_5ForCausalLM (OlmoHybridForCausalLM for an OLMo target); token
+    id t is chip token t, id S.VOCAB is PAD."""
+    from transformers import GenerationConfig
 
     c = c or core.build()
+    model_cls, config_cls, base, zero_gain = host(c.target)
     lay = pick_layout(len(c.dims))
     n_chip = c.n_layers()
     n_vocab = -(-(S.VOCAB + 1) // 64) * 64
-    tc = dict(BASE, hidden_size=lay.hidden, vocab_size=n_vocab, num_hidden_layers=n_chip + 1,
+    tc = dict(base, hidden_size=lay.hidden, vocab_size=n_vocab, num_hidden_layers=n_chip + 1,
               layer_types=["linear_attention"] * n_chip + ["full_attention"],
               linear_num_key_heads=c.target.key_heads, linear_num_value_heads=c.target.value_heads,
               intermediate_size=c.target.intermediate, eos_token_id=S.tok("HALT"),
               pad_token_id=S.VOCAB, bos_token_id=S.VOCAB)
     sd = emit_layers(c, lay, tc, 0, "model.", None, set(c.keep))
     sd["model.embed_tokens.weight"] = embedding_matrix(c, lay, n_vocab)
-    norm = torch.full((lay.hidden,), -1.0)  # (1 + w) = 0: the output head sees only the code
+    norm = torch.full((lay.hidden,), zero_gain)  # gain 0: the output head sees only the code
     for d in c.keep:
         norm[lay.dim(d)] = CODE_GAIN
     check_bf16("final norm", norm)
     sd["model.norm.weight"] = norm
-    model = Qwen3_5ForCausalLM(Qwen3_5TextConfig(**tc))
+    model = model_cls._from_config(config_cls(**tc), dtype=dtype)
     for p in model.parameters():
         p.data.zero_()
     missing, unexpected = model.load_state_dict(sd, strict=False)
     assert not unexpected, unexpected[:5]
     assert all(k.startswith(f"model.layers.{n_chip}.") or k == "lm_head.weight" for k in missing)
-    model.tie_weights()
+    finish(model)
     model.generation_config = GenerationConfig(eos_token_id=S.tok("HALT"), pad_token_id=S.VOCAB,
                                                do_sample=False)
     model.layout = lay
