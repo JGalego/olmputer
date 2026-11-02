@@ -216,6 +216,9 @@ def build_merged(src, dst, mute_qwen: bool = True, hidden: int | None = None,
     if olmo:  # the untied head: the embedding's chip columns, OLMo's own rows on its dims
         head = emb.clone()
         head[:v0, :d0] = base_head[:v0, :d0]
+        # the vocabulary's padding rows (after the chip tokens) score like chip tokens on tau:
+        # as zero rows they would score 0, above OLMo's best when all its logits are negative
+        head[v0 + S.VOCAB:, lay.dim(next(iter(c.tau.terms)))] = -1.0
         sd["lm_head.weight"] = head
         del base_head
 
