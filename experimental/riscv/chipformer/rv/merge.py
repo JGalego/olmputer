@@ -148,7 +148,8 @@ def build_merged(src, dst, mute_qwen: bool = True, hidden: int | None = None,
     if olmo:
         mute_qwen = False  # (see the module docstring)
         tc.update(tie_word_embeddings=False, architectures=["OlmoHybridForCausalLM"],
-                  model_type="olmo_hybrid")
+                  model_type="olmo_hybrid",  # (head_dim defaults to hidden / heads: keep OLMo's)
+                  head_dim=tc0.get("head_dim", d0 // tc0["num_attention_heads"]))
     else:
         tc.update(mtp_num_hidden_layers=0, tie_word_embeddings=True,
                   architectures=["Qwen3_5ForCausalLM"], model_type="qwen3_5_text")
