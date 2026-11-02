@@ -56,7 +56,10 @@ def chip_token_names() -> list[str]:
     return names
 
 
-def extend_tokenizer(src: Path, dst: Path, first_id: int) -> None:
+def extend_tokenizer(src: Path, dst: Path, first_id: int, decoder: bool = True) -> None:
+    """The host's tokenizer with the chip tokens appended. ``decoder``: also list them in
+    tokenizer_config.json's added_tokens_decoder (tokenizer.json already has them; 230k entries
+    make a 42 MB config the Hub won't parse)."""
     import shutil
 
     from tokenizers import AddedToken, Tokenizer
@@ -73,7 +76,7 @@ def extend_tokenizer(src: Path, dst: Path, first_id: int) -> None:
         if (src / f).exists():
             shutil.copy(src / f, dst / f)
     tc = json.loads((src / "tokenizer_config.json").read_text(encoding="utf-8"))
-    dec = tc.setdefault("added_tokens_decoder", {})
+    dec = tc.setdefault("added_tokens_decoder", {}) if decoder else {}
     for i, t in enumerate(pad + chip):
         dec[str(n + i)] = {"content": t.content, "lstrip": False, "normalized": False,
                            "rstrip": False, "single_word": False, "special": True}
@@ -249,7 +252,7 @@ def build_merged(src, dst, mute_qwen: bool = True, hidden: int | None = None,
         index["weight_map"].update({k: name for k in sh})
     (dst / "model.safetensors.index.json").write_text(json.dumps(index, indent=2))
     (dst / "config.json").write_text(json.dumps(tc, indent=2))
-    extend_tokenizer(src, dst, v0)
+    extend_tokenizer(src, dst, v0, decoder=not olmo)
     if olmo:
         gen = json.loads((src / "generation_config.json").read_text()) | {"do_sample": False}
     else:
