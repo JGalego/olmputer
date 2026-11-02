@@ -14,6 +14,10 @@ weights kept as sparse rows (CSR, padded per sublayer to a power-of-2 width KP s
   apply  residual += output buffer; after a head sublayer its lag history moves on
 
     Executor2(c, batch).step(x) -> x after the whole circuit (in place)
+
+A head's state is a PK x PV tile: its key rows and value columns padded to powers of 2 (Qwen3.5:
+128 x 128; OLMo-Hybrid's 96 x 192 heads: 128 x 256); the ballast columns come from a mask and
+the norm divides by the real value width.
 """
 
 import numpy as np
@@ -22,7 +26,7 @@ import triton
 import triton.language as tl
 
 from chipformer.dsl.graph import ONE
-from chipformer.q35.ir import FFN, HD, Head
+from chipformer.q35.ir import FFN, Head
 
 
 def _csr(rows):
@@ -81,7 +85,7 @@ def _lag_load(xb, hb, i, m, D):
 
 @triton.jit
 def _rows(xb, hb, D, rp, ix, w, base, ch, KP: tl.constexpr):
-    """relu of 128 sparse rows (row base + ch) over the lagged residual."""
+    """relu of len(ch) sparse rows (row base + ch) over the lagged residual."""
     r0 = tl.load(rp + base + ch)
     n = tl.load(rp + base + ch + 1) - r0
     kk = tl.arange(0, KP)
@@ -105,46 +109,48 @@ def _scalar(xb, hb, D, rp, ix, w, vh):
 @triton.jit
 def _head_kernel(x_ptr, h_ptr, S_ptr, y_ptr, D, V,
                  qrp, qix, qw, krp, kix, kw, vrp, vix, vw, zrp, zix, zw,
-                 arp, aix, aw, brp, bix, bw, bconst, odim, ow, khead, nrows,
+                 arp, aix, aw, brp, bix, bw, bconst, odim, ow, khead, nrows, refm, ncols,
                  KQ: tl.constexpr, KK: tl.constexpr, KV: tl.constexpr, KZ: tl.constexpr,
-                 QHOT: tl.constexpr):
+                 QHOT: tl.constexpr, PK: tl.constexpr, PV: tl.constexpr):
     vh = tl.program_id(0)
     bat = tl.program_id(1)
-    ch = tl.arange(0, 128)
+    rk = tl.arange(0, PK)  # key rows
+    cv = tl.arange(0, PV)  # value columns
     xb = x_ptr + bat * D
     hb = h_ptr + bat * 3 * D
     h = tl.load(khead + vh)
-    k = _rows(xb, hb, D, krp, kix, kw, h * 128, ch, KK)
-    v = _rows(xb, hb, D, vrp, vix, vw, vh * 128, ch, KV)
-    z = _rows(xb, hb, D, zrp, zix, zw, vh * 128, ch, KZ)
-    q = _rows(xb, hb, D, qrp, qix, qw, h * 128, ch, KQ)
+    k = _rows(xb, hb, D, krp, kix, kw, h * PK, rk, KK)
+    v = _rows(xb, hb, D, vrp, vix, vw, vh * PV, cv, KV)
+    z = _rows(xb, hb, D, zrp, zix, zw, vh * PV, cv, KZ)
+    q = _rows(xb, hb, D, qrp, qix, qw, h * PK, rk, KQ)
     bv = _scalar(xb, hb, D, brp, bix, bw, vh) + tl.load(bconst + vh)
-    Sb = S_ptr + (bat * V + vh) * 16384
+    Sb = S_ptr + (bat * V + vh) * (PK * PV)
     nr = tl.load(nrows + vh)  # > 0: the head decays, in its first nr rows
     if nr > 0:
         av = _scalar(xb, hb, D, arp, aix, aw, vh)
         fac = tl.where(av == 0.0, 1.0, tl.where(av == 110.0, 0.5, 0.0))
         if fac != 1.0:
             for r in range(nr):
-                tl.store(Sb + r * 128 + ch, tl.load(Sb + r * 128 + ch) * fac)
+                tl.store(Sb + r * PV + cv, tl.load(Sb + r * PV + cv) * fac)
     kmax = tl.max(k, axis=0)
     krow = tl.argmax(k, axis=0)
     if (kmax > 0.0) & (bv == 1.0):
-        tl.store(Sb + krow * 128 + ch, v)
+        tl.store(Sb + krow * PV + cv, v)
     tl.debug_barrier()
-    # the read: the sum of the rows whose query is set (multi-hot queries have equal values)
-    o = tl.zeros([128], dtype=tl.float32)
+    # the read: the sum of the rows whose query is set (multi-hot queries have equal values; a
+    # padded byte read's pad rows are never written, so they add 0)
+    o = tl.zeros([PV], dtype=tl.float32)
     for _ in range(QHOT):
         qm = tl.max(q, axis=0)
         qi = tl.argmax(q, axis=0)
         if qm > 0.0:
-            o += tl.load(Sb + qi * 128 + ch)
-        q = tl.where(ch == qi, 0.0, q)
-    ref = tl.sum(tl.where(ch < 2, o * o, 0.0), axis=0)
-    norm = tl.math.sqrt_rn(ref / 128.0)
+            o += tl.load(Sb + qi * PV + cv)
+        q = tl.where(rk == qi, 0.0, q)
+    ref = tl.sum(tl.load(refm + cv) * o * o, axis=0)
+    norm = tl.math.sqrt_rn(ref / ncols)
     out = tl.where(ref > 0.0, tl.math.div_rn(o, tl.where(ref > 0.0, norm, 1.0)), 0.0)
-    wv = tl.load(ow + vh * 128 + ch)
-    dd = tl.load(odim + vh * 128 + ch)
+    wv = tl.load(ow + vh * PV + cv)
+    dd = tl.load(odim + vh * PV + cv)
     tl.atomic_add(y_ptr + bat * D + dd, out * z * wv, mask=wv != 0.0)
 
 
@@ -177,6 +183,11 @@ class Executor2:
         self.c, self.B, self.dev = c, batch, device
         D = len(c.dims)
         self.D = D
+        tg = c.target
+        PK, PV = (1 << (n - 1).bit_length() for n in (tg.dk, tg.dv))
+        self.PK, self.PV, self.ncols = PK, PV, float(tg.dv)
+        refm = np.zeros(PV, np.float32)
+        refm[list(tg.ref_cols)] = 1.0
         t = lambda a, dt=torch.int32: torch.tensor(np.asarray(a), dtype=dt, device=device)
 
         def dev3(arr):
@@ -204,12 +215,12 @@ class Executor2:
 
             qrows, krows = [], []
             for n in heads:
-                for s in range(HD):
+                for s in range(PK):
                     qrows.append(lagged(n.q[s]) if s in n.q else {})
                     krows.append(lagged(n.k[s]) if s in n.k else {})
             vrows, zrows, arows, brows, bconst, odim, ow, khead, nrows = ([] for _ in range(9))
             for h, vd in vh:
-                for col in range(HD):
+                for col in range(PV):
                     vrows.append(lagged(vd.v[col]) if col in vd.v else {})
                     zrows.append({d: float(cf) for d, cf in vd.z[col].terms.items()}
                                  if col in vd.z else {})
@@ -220,7 +231,7 @@ class Executor2:
                 else:
                     brows.append({d: float(cf) for d, cf in vd.beta.terms.items()})
                     bconst.append(0.0)
-                od, w_ = np.zeros(HD, np.int32), np.zeros(HD, np.float32)
+                od, w_ = np.zeros(PV, np.int32), np.zeros(PV, np.float32)
                 for col, d, w in vd.out:
                     od[col], w_[col] = d, w
                 odim.append(od)
@@ -237,7 +248,8 @@ class Executor2:
                   "QHOT": max(getattr(n, "qhot", 2) for n in heads),
                   "bconst": t(bconst, torch.float32), "odim": t(np.concatenate(odim)),
                   "ow": t(np.concatenate(ow), torch.float32), "khead": t(khead),
-                  "nrows": t(nrows), "S": torch.zeros(batch, V, HD, HD, device=device),
+                  "nrows": t(nrows), "S": torch.zeros(batch, V, PK, PV, device=device),
+                  "refm": t(refm, torch.float32),
                   "hist": torch.zeros(batch, 3, D, device=device)}  # lags 1..3
             self.steps.append(st)
         self.y = torch.zeros(batch, D, device=device)
@@ -253,7 +265,7 @@ class Executor2:
                 init = n.init or []
                 for x in range(len(n.vheads())):
                     for r, vec in (init[x] if x < len(init) else {}).items():
-                        buf[j, r] = vec
+                        buf[j, r, :len(vec)] = vec
                     j += 1
             st["S"][row].copy_(torch.from_numpy(buf))
 
@@ -283,8 +295,8 @@ class Executor2:
             _head_kernel[(st["V"], B)](
                 x, st["hist"], st["S"], self.y, D, st["V"], *st["q"], *st["k"], *st["v"],
                 *st["z"], *st["a"], *st["b"], st["bconst"], st["odim"], st["ow"], st["khead"],
-                st["nrows"], KQ=st["KQ"], KK=st["KK"], KV=st["KV"], KZ=st["KZ"],
-                QHOT=st["QHOT"])
+                st["nrows"], st["refm"], self.ncols, KQ=st["KQ"], KK=st["KK"], KV=st["KV"],
+                KZ=st["KZ"], QHOT=st["QHOT"], PK=self.PK, PV=self.PV)
             _apply_kernel[grid_apply](x, self.y, st["hist"], D, HIST=True, BLOCK=1024)
         return x
 

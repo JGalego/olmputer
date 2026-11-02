@@ -116,12 +116,15 @@ class RvChat:
         self.c = core.build(target_of(self.model.config.to_dict()), self.T)
         self.n_chip, self.v0 = self.meta["chip_layers"], self.meta["chip_token_offset"]
         self.code_dims = torch.tensor(self.meta["code_dims"], device=self.dev)
-        # OLMo-Hybrid: NoPE, and the fast and executor chip paths are Qwen3.5's (HF path only)
+        # OLMo-Hybrid: NoPE; the fast chip path is Qwen3.5 module code (HF path or executor)
         self.olmo = self.meta.get("host") == "olmo_hybrid"
         self.eos = {100257, 100265} if self.olmo else {248046, 248044}
         self.fast = fast and self.dev == "cuda" and not self.olmo
         # executor "verify": both chip paths, the HF view's hc checked against the executor's
-        self.executor = executor if self.dev == "cuda" and not self.olmo else False
+        # (Qwen3.5 only: it needs the fast path)
+        self.executor = executor if self.dev == "cuda" else False
+        if self.olmo and self.executor == "verify":
+            raise ValueError("executor verify needs the fast chip path (Qwen3.5 only)")
         self.verify = self.executor == "verify"
         if self.executor:
             self._build_exec()
@@ -279,11 +282,14 @@ class RvChat:
     def _qwen_step(self, hc, cache, pos: int):
         """Qwen's layers on a text token whose residual after the chip layers is hc."""
         h = hc.view(1, 1, -1)
-        p4 = torch.full((4, 1, 1), pos, device=self.dev, dtype=torch.long)
-        pe = self.lm.rotary_emb(h, p4[1:])
+        if self.olmo:  # NoPE
+            pe, tp = None, torch.tensor([[pos]], device=self.dev)
+        else:
+            p4 = torch.full((4, 1, 1), pos, device=self.dev, dtype=torch.long)
+            pe, tp = self.lm.rotary_emb(h, p4[1:]), p4[0]
         for i in range(self.n_chip, len(self.lm.layers)):
             h = self.lm.layers[i](h, position_embeddings=pe, attention_mask=None,
-                                  position_ids=p4[0], past_key_values=cache)
+                                  position_ids=tp, past_key_values=cache)
         return self.model.lm_head(self.lm.norm(h))[0, -1]
 
     # --- one position ----------------------------------------------------------------------
