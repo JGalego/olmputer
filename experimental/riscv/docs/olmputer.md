@@ -247,8 +247,11 @@ with commas and dropping or changing digits, e.g. `8441394907539` answered as
 The suite on `cfaef76` (Qwen and OLMo tests, the Qwen3.5 tokenizer, 8 workers): 347 passed, 24
 skipped, 2 failed: `test_fuzz_free_running_cpu`, which fails on upstream `bec1a0c` too
 (`fastexec.py` does not know the bridge's `Q` family: upstream's baseline is 247 passed, 1
-failed), and `test_digit_groups_are_olmo_tokens`, a test bug (fixed in `9b7d74b`, passing). The
-Qwen path is byte-identical to upstream: 453/453 hashes of Qwen rv-tiny's tensors and snapshot
+failed), and `test_digit_groups_are_olmo_tokens`, a test bug (fixed in `9b7d74b`, passing). With
+`RV_SLOW=1` on `98639df` (cpu-xl, 8 workers, `--dist worksteal`): 360 passed, 12 skipped, 1
+failed (`test_fuzz_free_running_cpu` again) in 2 h 40 min; the long traces (c-sieve, c-sort,
+c-crc32p, c-gmpmul) pass teacher-forced on both Qwen3.5's and OLMo's heads, c-sieve taking about
+2.4 h on each. The Qwen path is byte-identical to upstream: 453/453 hashes of Qwen rv-tiny's tensors and snapshot
 rows match.
 
 ## The executor on OLMo's heads (`rv/tritonexec.py`)
